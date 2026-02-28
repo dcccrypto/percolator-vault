@@ -1,0 +1,20 @@
+# Rust / Cargo
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Solana
+test-ledger/
+*.so
+
+# Kani
+kani-proofs/target/

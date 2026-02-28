@@ -1,0 +1,29 @@
+[package]
+name = "percolator-vault"
+version = "0.1.0"
+edition = "2021"
+description = "Percolator LP Vault — insurance staking and trading LP vault for Percolator perpetuals"
+license = "Apache-2.0"
+repository = "https://github.com/dcccrypto/percolator-vault"
+
+[features]
+no-entrypoint = []
+test = []
+kani = []
+
+[dependencies]
+solana-program = "=2.2.1"
+spl-token = { version = "=6.0.0", features = ["no-entrypoint"] }
+bytemuck = { version = "1.14", features = ["derive"] }
+# Pin blake3 to avoid edition2024 (SBF platform-tools has Rust 1.84)
+blake3 = ">=1.5.0, <1.8.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dev-dependencies]
+solana-sdk = "=2.2.1"
+proptest = "1.4"
