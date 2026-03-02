@@ -211,19 +211,13 @@ impl StakePool {
     // ════════════════════════════════════════════════════════════
 
     /// Whether this market has been resolved (blocks further deposits).
-    /// Checks byte 9 bit 0 (new location). For backward compat, also accepts
-    /// byte 0 == 1 if discriminator is not set (pre-versioning accounts).
+    /// Checks byte 9 bit 0 (canonical location).
+    ///
+    /// Note: Legacy code set `_reserved[0] = 1` for resolved, but bytes 0-7
+    /// are now the discriminator. No pre-upgrade resolved pools exist on-chain
+    /// (this program hasn't launched yet), so no backward compat needed.
     pub fn is_resolved(&self) -> bool {
-        // New location: byte 9, bit 0
-        if self._reserved[9] & 0x01 != 0 {
-            return true;
-        }
-        // Legacy: byte 0 was used before discriminator was added.
-        // Only check if discriminator is zeroed (pre-upgrade account).
-        if self._reserved[..8] == [0u8; 8] && self._reserved[0] != 0 {
-            return true;
-        }
-        false
+        self._reserved[9] & 0x01 != 0
     }
 
     /// Set the resolved flag (byte 9, bit 0).
