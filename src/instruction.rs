@@ -182,6 +182,16 @@ pub enum StakeInstruction {
         cooldown_slots: u64,
         deposit_cap: u64,
     },
+
+    /// PERC-313: Admin sets high-water mark config.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    AdminSetHwmConfig {
+        enabled: bool,
+        hwm_floor_bps: u16,
+    },
 }
 
 impl StakeInstruction {
@@ -295,6 +305,17 @@ impl StakeInstruction {
                 Ok(Self::InitTradingPool {
                     cooldown_slots,
                     deposit_cap,
+                })
+            }
+            14 => {
+                if rest.len() < 3 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let enabled = rest[0] != 0;
+                let hwm_floor_bps = u16::from_le_bytes(rest[1..3].try_into().unwrap());
+                Ok(Self::AdminSetHwmConfig {
+                    enabled,
+                    hwm_floor_bps,
                 })
             }
             _ => Err(ProgramError::InvalidInstructionData),

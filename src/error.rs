@@ -39,6 +39,8 @@ pub enum StakeError {
     InvalidAccount = 16,
     /// Pool mode mismatch (e.g., AccrueFees on insurance pool)
     InvalidPoolMode = 17,
+    /// Withdrawal would push TVL below high-water mark floor
+    WithdrawalBelowHwmFloor = 18,
 }
 
 impl From<StakeError> for ProgramError {

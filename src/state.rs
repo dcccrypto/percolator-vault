@@ -197,6 +197,94 @@ impl StakePool {
         disc == [0u8; 8] || disc == STAKE_POOL_DISCRIMINATOR
     }
 
+    // ════════════════════════════════════════════════════════════
+    // _reserved byte layout:
+    // ════════════════════════════════════════════════════════════
+    // Bytes 0-7:   discriminator (STAKE_POOL_DISCRIMINATOR)
+    // Byte  8:     version
+    // Byte  9:     flags (bit 0 = resolved, bit 1 = hwm_enabled)
+    // Bytes 10-11: hwm_floor_bps (u16 LE, default 5000 = 50%)
+    // Bytes 12-15: reserved padding
+    // Bytes 16-23: epoch_high_water_tvl (u64 LE)
+    // Bytes 24-31: hwm_last_epoch (u64 LE)
+    // Bytes 32-63: free
+    // ════════════════════════════════════════════════════════════
+
+    /// Whether this market has been resolved (blocks further deposits).
+    /// Checks byte 9 bit 0 (canonical location).
+    ///
+    /// Note: Legacy code set `_reserved[0] = 1` for resolved, but bytes 0-7
+    /// are now the discriminator. No pre-upgrade resolved pools exist on-chain
+    /// (this program hasn't launched yet), so no backward compat needed.
+    pub fn is_resolved(&self) -> bool {
+        self._reserved[9] & 0x01 != 0
+    }
+
+    /// Set the resolved flag (byte 9, bit 0).
+    pub fn set_resolved(&mut self) {
+        self._reserved[9] |= 0x01;
+    }
+
+    /// Whether high-water mark protection is enabled (byte 9, bit 1).
+    pub fn hwm_enabled(&self) -> bool {
+        self._reserved[9] & 0x02 != 0
+    }
+
+    /// Set high-water mark enabled flag (byte 9, bit 1).
+    pub fn set_hwm_enabled(&mut self, enabled: bool) {
+        if enabled {
+            self._reserved[9] |= 0x02;
+        } else {
+            self._reserved[9] &= !0x02;
+        }
+    }
+
+    /// High-water mark floor in basis points (e.g. 5000 = 50%).
+    pub fn hwm_floor_bps(&self) -> u16 {
+        u16::from_le_bytes([self._reserved[10], self._reserved[11]])
+    }
+
+    /// Set high-water mark floor bps.
+    pub fn set_hwm_floor_bps(&mut self, bps: u16) {
+        let bytes = bps.to_le_bytes();
+        self._reserved[10] = bytes[0];
+        self._reserved[11] = bytes[1];
+    }
+
+    /// Epoch high-water mark TVL (max pool value seen in current epoch).
+    pub fn epoch_high_water_tvl(&self) -> u64 {
+        u64::from_le_bytes(self._reserved[16..24].try_into().unwrap())
+    }
+
+    /// Set epoch high-water mark TVL.
+    pub fn set_epoch_high_water_tvl(&mut self, tvl: u64) {
+        self._reserved[16..24].copy_from_slice(&tvl.to_le_bytes());
+    }
+
+    /// Last epoch when HWM was updated.
+    pub fn hwm_last_epoch(&self) -> u64 {
+        u64::from_le_bytes(self._reserved[24..32].try_into().unwrap())
+    }
+
+    /// Set last HWM epoch.
+    pub fn set_hwm_last_epoch(&mut self, epoch: u64) {
+        self._reserved[24..32].copy_from_slice(&epoch.to_le_bytes());
+    }
+
+    /// Refresh HWM tracking for a new epoch. If current epoch differs from
+    /// the stored epoch, reset epoch_high_water_tvl to the current pool value.
+    /// Then update the HWM if current_tvl exceeds it.
+    /// Returns the (possibly updated) epoch_high_water_tvl.
+    pub fn refresh_hwm(&mut self, current_epoch: u64, current_tvl: u64) -> u64 {
+        if current_epoch != self.hwm_last_epoch() {
+            self.set_epoch_high_water_tvl(current_tvl);
+            self.set_hwm_last_epoch(current_epoch);
+        } else if current_tvl > self.epoch_high_water_tvl() {
+            self.set_epoch_high_water_tvl(current_tvl);
+        }
+        self.epoch_high_water_tvl()
+    }
+
     /// Total pool value = deposited - withdrawn - flushed + returned.
     ///
     /// This equals the actual vault balance and reflects what LP holders can withdraw.

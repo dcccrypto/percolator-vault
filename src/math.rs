@@ -395,6 +395,75 @@ mod tests {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// PERC-313: High-Water Mark Protection
+// ═══════════════════════════════════════════════════════════════
+
+/// Calculate the HWM floor: epoch_high_water_tvl × hwm_floor_bps / 10_000.
+/// Returns None on overflow (conservative deny).
+pub fn hwm_floor(epoch_high_water_tvl: u64, hwm_floor_bps: u16) -> Option<u64> {
+    let floor = (epoch_high_water_tvl as u128)
+        .checked_mul(hwm_floor_bps as u128)?
+        .checked_div(10_000)?;
+    if floor > u64::MAX as u128 {
+        None
+    } else {
+        Some(floor as u64)
+    }
+}
+
+/// Check whether a withdrawal is allowed under HWM protection.
+/// Returns `true` if post-withdrawal TVL >= floor.
+/// Returns `false` if it would push TVL below the HWM floor.
+pub fn hwm_withdrawal_allowed(
+    post_withdrawal_tvl: u64,
+    epoch_high_water_tvl: u64,
+    hwm_floor_bps: u16,
+) -> bool {
+    match hwm_floor(epoch_high_water_tvl, hwm_floor_bps) {
+        Some(floor) => post_withdrawal_tvl >= floor,
+        None => false, // overflow → conservative deny
+    }
+}
+
+#[cfg(test)]
+mod hwm_tests {
+    use super::*;
+
+    #[test]
+    fn test_hwm_floor_basic() {
+        assert_eq!(hwm_floor(1000, 5000), Some(500)); // 50% of 1000
+        assert_eq!(hwm_floor(1000, 10_000), Some(1000)); // 100% of 1000
+        assert_eq!(hwm_floor(1000, 0), Some(0)); // 0% floor
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_allowed_above_floor() {
+        assert!(hwm_withdrawal_allowed(600, 1000, 5000));
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_allowed_at_floor() {
+        assert!(hwm_withdrawal_allowed(500, 1000, 5000));
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_blocked_below_floor() {
+        assert!(!hwm_withdrawal_allowed(499, 1000, 5000));
+    }
+
+    #[test]
+    fn test_hwm_zero_floor_always_allows() {
+        assert!(hwm_withdrawal_allowed(0, 1000, 0));
+    }
+
+    #[test]
+    fn test_hwm_full_floor_requires_full() {
+        assert!(!hwm_withdrawal_allowed(999, 1000, 10_000));
+        assert!(hwm_withdrawal_allowed(1000, 1000, 10_000));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Kani Formal Verification
 // ═══════════════════════════════════════════════════════════════
 //
