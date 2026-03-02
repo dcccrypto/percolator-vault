@@ -86,6 +86,10 @@ pub fn process(
             cooldown_slots,
             deposit_cap,
         } => process_init_trading_pool(program_id, accounts, cooldown_slots, deposit_cap),
+        StakeInstruction::AdminSetHwmConfig {
+            enabled,
+            hwm_floor_bps,
+        } => process_admin_set_hwm_config(program_id, accounts, enabled, hwm_floor_bps),
     }
 }
 
@@ -313,7 +317,7 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     }
 
     // I7: Block deposits after market resolution
-    if pool._reserved[0] != 0 {
+    if pool.is_resolved() {
         return Err(StakeError::MarketResolved.into());
     }
 
@@ -399,8 +403,14 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
         .checked_add(lp_to_mint)
         .ok_or(StakeError::Overflow)?;
 
-    // Create or update per-user deposit PDA (cooldown tracking)
+    // PERC-313: Refresh high-water mark after deposit (TVL increased)
     let clock = Clock::from_account_info(clock_sysvar)?;
+    if pool.hwm_enabled() {
+        let current_tvl = pool.total_pool_value().unwrap_or(0);
+        pool.refresh_hwm(clock.epoch, current_tvl);
+    }
+
+    // Create or update per-user deposit PDA (cooldown tracking)
     let (expected_deposit_pda, deposit_bump) =
         state::derive_deposit_pda(program_id, pool_pda.key, user.key);
     if *deposit_pda.key != expected_deposit_pda {
@@ -542,6 +552,24 @@ fn process_withdraw(
         .ok_or(StakeError::Overflow)?;
     if collateral_amount == 0 {
         return Err(StakeError::ZeroAmount.into());
+    }
+
+    // PERC-313: High-water mark floor enforcement
+    if pool.hwm_enabled() {
+        let current_tvl = pool.total_pool_value().unwrap_or(0);
+        let hwm = pool.refresh_hwm(clock.epoch, current_tvl);
+        let post_tvl = current_tvl
+            .checked_sub(collateral_amount)
+            .ok_or(StakeError::Overflow)?;
+        if !crate::math::hwm_withdrawal_allowed(post_tvl, hwm, pool.hwm_floor_bps()) {
+            msg!(
+                "HWM block: post_tvl={} < floor(hwm={}, bps={})",
+                post_tvl,
+                hwm,
+                pool.hwm_floor_bps()
+            );
+            return Err(StakeError::WithdrawalBelowHwmFloor.into());
+        }
     }
 
     // Burn LP tokens from user
@@ -926,7 +954,7 @@ fn process_admin_resolve_market(program_id: &Pubkey, accounts: &[AccountInfo]) -
     {
         let mut pool_data = pool_pda.try_borrow_mut_data()?;
         let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
-        pool._reserved[0] = 1;
+        pool.set_resolved();
     }
 
     msg!("ResolveMarket forwarded via CPI");
@@ -1138,5 +1166,52 @@ fn process_init_trading_pool(
     pool.pool_mode = 1;
 
     msg!("InitTradingPool: pool_mode set to 1 (trading LP vault)");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 14: AdminSetHwmConfig — PERC-313
+// ═══════════════════════════════════════════════════════════════
+
+fn process_admin_set_hwm_config(
+    _program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    enabled: bool,
+    hwm_floor_bps: u16,
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
+
+    if pool.is_initialized != 1 {
+        return Err(StakeError::NotInitialized.into());
+    }
+    if !pool.validate_discriminator() {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    if pool.admin != admin.key.to_bytes() {
+        return Err(StakeError::Unauthorized.into());
+    }
+
+    // Validate floor bps: 0–10000 (0% to 100%)
+    if hwm_floor_bps > 10_000 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+
+    pool.set_hwm_enabled(enabled);
+    pool.set_hwm_floor_bps(hwm_floor_bps);
+
+    msg!(
+        "AdminSetHwmConfig: enabled={}, floor_bps={}",
+        enabled,
+        hwm_floor_bps
+    );
     Ok(())
 }
