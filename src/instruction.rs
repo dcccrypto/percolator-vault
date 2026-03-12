@@ -188,10 +188,7 @@ pub enum StakeInstruction {
     /// Accounts:
     ///   0. `[signer]` Admin
     ///   1. `[writable]` Pool PDA
-    AdminSetHwmConfig {
-        enabled: bool,
-        hwm_floor_bps: u16,
-    },
+    AdminSetHwmConfig { enabled: bool, hwm_floor_bps: u16 },
 }
 
 impl StakeInstruction {
