@@ -296,17 +296,33 @@ impl StakePool {
     /// includes the flushed amount. Missing `-flushed` causes phantom inflation
     /// that makes the pool insolvent after any flush+return cycle.
     pub fn total_pool_value(&self) -> Option<u64> {
-        let base = self
-            .total_deposited
-            .checked_sub(self.total_withdrawn)?
-            .checked_sub(self.total_flushed)?
-            .checked_add(self.total_returned)?;
-        // PERC-272: Include accrued trading fees for trading LP pools
-        if self.pool_mode == 1 {
-            base.checked_add(self.total_fees_earned)
-        } else {
-            Some(base)
-        }
+        // Sum ALL positive terms before subtracting the negatives so a
+        // legitimate intermediate state does not underflow u64 mid-computation.
+        //
+        // Bug this fixes: on a mode-1 (trading) pool, withdrawals pay out the
+        // fee-appreciated `collateral_amount` (principal + accrued fees), and
+        // the withdraw handler adds that full amount to `total_withdrawn`
+        // without decrementing `total_fees_earned`. Once cumulative payouts
+        // exceed gross deposits — which happens routinely after any fees are
+        // earned and an LP exits — the old `total_deposited - total_withdrawn`
+        // step returned None even though the TRUE value (with `+ fees`) is
+        // still >= 0. That None then bricked the pool: every subsequent
+        // withdraw (math via `?`), deposit, and AccrueFees crank reverted,
+        // freezing the remaining LPs' funds. Adding the fees first makes the
+        // identical net value evaluate without an intermediate underflow.
+        let positives = {
+            let p = self.total_deposited.checked_add(self.total_returned)?;
+            // PERC-272: include accrued trading fees for trading LP pools.
+            if self.pool_mode == 1 {
+                p.checked_add(self.total_fees_earned)?
+            } else {
+                p
+            }
+        };
+        let negatives = self.total_withdrawn.checked_add(self.total_flushed)?;
+        // Still fails closed (None) on a genuinely invalid over-withdrawn
+        // state where negatives truly exceed all positives.
+        positives.checked_sub(negatives)
     }
 
     /// Calculate LP tokens for a deposit amount.
