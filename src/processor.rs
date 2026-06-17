@@ -523,6 +523,23 @@ fn process_withdraw(
         return Err(StakeError::InvalidAccount.into());
     }
 
+    // Validate the deposit PDA's derivation AND ownership before trusting any
+    // of its bytes. Without this, a withdrawer can pass an attacker-crafted
+    // account (owned by any program / System) whose bytes are shaped like a
+    // StakeDeposit with last_deposit_slot=0 and lp_amount=u64::MAX, which
+    // sails through the in-data checks below and bypasses (a) the withdrawal
+    // cooldown and (b) the per-deposit lp_amount accounting — defeating the
+    // anti-flash / fee-front-running protection the cooldown exists for, and
+    // leaving the real StakeDeposit record (with its live cooldown) untouched.
+    // process_deposit already performs exactly these checks; withdraw must too.
+    let (expected_deposit_pda, _) = state::derive_deposit_pda(program_id, pool_pda.key, user.key);
+    if *deposit_pda.key != expected_deposit_pda {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if *deposit_pda.owner != *program_id {
+        return Err(StakeError::InvalidAccount.into());
+    }
+
     // Check cooldown
     let clock = Clock::from_account_info(clock_sysvar)?;
     let deposit_data_ref = deposit_pda.try_borrow_data()?;
