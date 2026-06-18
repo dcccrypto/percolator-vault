@@ -188,6 +188,33 @@ fn test_pool_value_flush_partial_return() {
 }
 
 #[test]
+fn test_pool_value_mode1_fee_appreciated_withdrawal_does_not_brick() {
+    // Regression: a mode-1 (trading) pool earns fees, then an LP withdraws
+    // the fee-appreciated amount. The withdraw handler adds the full
+    // (principal + fee) payout to total_withdrawn without decrementing
+    // total_fees_earned, so total_withdrawn legitimately exceeds
+    // total_deposited. The TRUE pool value is still >= 0 (the fees cover the
+    // gap), and total_pool_value() must return it rather than underflow to
+    // None — otherwise the pool bricks for every remaining LP.
+    let mut pool = new_pool();
+    pool.pool_mode = 1;
+    pool.total_deposited = 1_000_000;
+    pool.total_fees_earned = 1_000_000; // share price doubled via fees
+    pool.total_withdrawn = 2_000_000; // one LP exited at 2x (1M principal + 1M fees)
+
+    // 1M deposited + 1M fees - 2M withdrawn = 0, NOT None.
+    assert_eq!(
+        pool.total_pool_value(),
+        Some(0),
+        "fee-appreciated full exit must compute to 0, not underflow-brick the pool"
+    );
+
+    // And a pool that is still solvent after such an exit reports the remainder.
+    pool.total_fees_earned = 1_500_000; // 1M deposit + 1.5M fees = 2.5M, 2M withdrawn
+    assert_eq!(pool.total_pool_value(), Some(500_000));
+}
+
+#[test]
 fn test_pool_value_underflow_returns_zero() {
     let mut pool = new_pool();
     pool.total_deposited = 100;
