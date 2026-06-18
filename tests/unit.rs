@@ -215,6 +215,39 @@ fn test_pool_value_mode1_fee_appreciated_withdrawal_does_not_brick() {
 }
 
 #[test]
+fn test_accrual_baseline_mode1_fee_appreciated_does_not_brick_crank() {
+    // Regression for the AccrueFees crank: process_accrue_fees previously
+    // computed its baseline inline as total_deposited.checked_sub(total_withdrawn)
+    // + total_fees_earned, which returned None (→ StakeError::Overflow → revert)
+    // once total_withdrawn exceeded total_deposited on a fee-appreciated mode-1
+    // pool — permanently freezing fee booking. accrual_baseline() sums positives
+    // first so the identical net value computes without underflow.
+    let mut pool = new_pool();
+    pool.pool_mode = 1;
+    pool.total_deposited = 1_000_000;
+    pool.total_fees_earned = 1_000_000;
+    pool.total_withdrawn = 2_000_000; // > total_deposited (old inline math → None → crank bricked)
+
+    // 1M deposited + 1M fees - 2M withdrawn = 0, NOT None.
+    assert_eq!(
+        pool.accrual_baseline(),
+        Some(0),
+        "accrual baseline must compute to 0 (not underflow-revert the AccrueFees crank)"
+    );
+
+    // Still solvent → reports the remainder; matches total_pool_value when no flush/return.
+    pool.total_fees_earned = 1_500_000;
+    assert_eq!(pool.accrual_baseline(), Some(500_000));
+    assert_eq!(pool.accrual_baseline(), pool.total_pool_value(),
+        "with no flush/return, accrual baseline equals total_pool_value");
+
+    // Fails closed on a genuinely over-withdrawn state (negatives exceed positives).
+    pool.total_fees_earned = 0;
+    pool.total_withdrawn = 2_000_000; // 1M deposited + 0 fees < 2M withdrawn
+    assert_eq!(pool.accrual_baseline(), None, "truly over-withdrawn state still fails closed");
+}
+
+#[test]
 fn test_pool_value_underflow_returns_zero() {
     let mut pool = new_pool();
     pool.total_deposited = 100;
