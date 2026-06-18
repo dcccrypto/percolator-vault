@@ -325,6 +325,32 @@ impl StakePool {
         positives.checked_sub(negatives)
     }
 
+    /// Expected vault token balance baseline used by the AccrueFees crank:
+    /// principal net of withdrawals plus already-booked fees
+    /// (`total_deposited + total_fees_earned - total_withdrawn`). Any current
+    /// vault balance above this is treated as newly-arrived (unbooked) fees.
+    ///
+    /// Sums the positive terms BEFORE subtracting `total_withdrawn` for the same
+    /// reason as `total_pool_value` (PERC: pool-value underflow): on a mode-1
+    /// pool, withdrawals pay out the fee-appreciated amount and bump
+    /// `total_withdrawn` past `total_deposited`, with fees covering the gap. The
+    /// old inline `total_deposited.checked_sub(total_withdrawn)` in
+    /// `process_accrue_fees` then returned `None` and made the permissionless
+    /// AccrueFees crank revert FOREVER, permanently freezing fee booking. This
+    /// ordering computes the identical net value without the intermediate
+    /// underflow, and still fails closed (None) on a truly over-withdrawn state.
+    ///
+    /// NOTE (preserved behavior, flagged for review): this baseline intentionally
+    /// mirrors the prior inline math and does NOT include `total_flushed`/
+    /// `total_returned`. If a fee-accruing mode-1 pool ever flushes collateral to
+    /// the trading venue, this baseline diverges from `total_pool_value`; that is
+    /// a separate accounting question and is left unchanged here.
+    pub fn accrual_baseline(&self) -> Option<u64> {
+        self.total_deposited
+            .checked_add(self.total_fees_earned)?
+            .checked_sub(self.total_withdrawn)
+    }
+
     /// Calculate LP tokens for a deposit amount.
     /// Delegates to pure math module (Kani-verified).
     pub fn calc_lp_for_deposit(&self, amount: u64) -> Option<u64> {

@@ -1134,16 +1134,14 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 
     let clock = Clock::from_account_info(clock_ai)?;
 
-    // Compute fee delta: any balance increase beyond what was deposited (net of withdrawals)
-    // pool_value = total_deposited - total_withdrawn + total_fees_earned
-    // If current_balance > pool_value, the difference is new fees
-    // Use checked_sub for defense-in-depth (saturating_sub hides accounting bugs)
-    let pool_value = pool
-        .total_deposited
-        .checked_sub(pool.total_withdrawn)
-        .ok_or(StakeError::Overflow)?
-        .checked_add(pool.total_fees_earned)
-        .ok_or(StakeError::Overflow)?;
+    // Compute fee delta: any balance increase beyond the accrual baseline
+    // (total_deposited + total_fees_earned - total_withdrawn) is new fees.
+    // Routed through StakePool::accrual_baseline, which sums positives before
+    // subtracting total_withdrawn so a fee-appreciated mode-1 pool (where
+    // total_withdrawn legitimately exceeds total_deposited) does NOT underflow
+    // and revert this permissionless crank forever. Still fails closed (None)
+    // on a truly over-withdrawn state.
+    let pool_value = pool.accrual_baseline().ok_or(StakeError::Overflow)?;
 
     if current_balance > pool_value {
         let fee_delta = current_balance - pool_value;
