@@ -106,12 +106,81 @@ pub fn pool_value_with_fees(
 
 /// Calculate available flush amount.
 ///
-/// `available = deposited - withdrawn - already_flushed`
+/// `available = deposited + returned - withdrawn - flushed`
 /// Uses saturating arithmetic (can't go negative).
-pub fn flush_available(total_deposited: u64, total_withdrawn: u64, total_flushed: u64) -> u64 {
+///
+/// `total_returned` (insurance withdrawn back into the vault after resolution)
+/// is real collateral physically sitting in the vault, so it is re-flushable.
+/// Omitting it (the previous formula) made returned insurance permanently
+/// un-flushable even though the tokens were in the vault. Positives are summed
+/// (saturating) before the negatives so a valid intermediate state cannot clamp
+/// to 0 mid-computation.
+pub fn flush_available(
+    total_deposited: u64,
+    total_returned: u64,
+    total_withdrawn: u64,
+    total_flushed: u64,
+) -> u64 {
     total_deposited
+        .saturating_add(total_returned)
         .saturating_sub(total_withdrawn)
         .saturating_sub(total_flushed)
+}
+
+/// Stake-weighted-average deposit slot for the withdrawal cooldown.
+///
+/// When a depositor tops up an existing LP position, resetting
+/// `last_deposit_slot` to the current slot unconditionally would re-lock the
+/// depositor's ENTIRE aged position under the cooldown — a tiny top-up could
+/// freeze a large, long-aged position for the full cooldown again.
+///
+/// Instead, blend the existing position's age with the new deposit, weighted by
+/// LP amount:
+///
+/// `new_slot = (existing_lp * existing_slot + new_lp * current_slot)
+///              / (existing_lp + new_lp)`
+///
+/// * If `existing_lp == 0` (first deposit, or the position was fully withdrawn),
+///   the result is exactly `current_slot`.
+/// * A tiny top-up onto a large aged position barely moves the slot forward, so
+///   it cannot re-lock the whole position.
+/// * A large fresh deposit onto a small aged position pulls the slot toward
+///   `current_slot` proportionally, so the cooldown still meaningfully covers
+///   the new funds (anti-flash protection preserved).
+///
+/// Rounds DOWN (toward the older slot). The result is always within
+/// `[min(existing_slot, current_slot), max(existing_slot, current_slot)]`, so it
+/// never produces a slot in the future and never panics.
+///
+/// Implemented in offset form (`lo + weighted_span / total_lp`) so the only
+/// large product is `weight * span` with `weight <= total_lp <= 2^65`; this
+/// single u128 product cannot overflow, whereas the naive
+/// `lp0*slot0 + lp1*slot1` sum of two `(u64::MAX)^2`-sized products would.
+pub fn weighted_deposit_slot(
+    existing_lp: u64,
+    existing_slot: u64,
+    new_lp: u64,
+    current_slot: u64,
+) -> u64 {
+    let total_lp = (existing_lp as u128) + (new_lp as u128);
+    if total_lp == 0 {
+        // No LP on either side — nothing aged, nothing new. Anchor to now.
+        return current_slot;
+    }
+    // Anchor at the lower of the two slots and blend only the spans above it.
+    // Exactly one side contributes a nonzero span, so there is no sum of two
+    // large products and thus no u128 overflow even at u64::MAX inputs.
+    let lo = existing_slot.min(current_slot);
+    let existing_span = (existing_slot - lo) as u128; // 0 if existing is the lower
+    let current_span = (current_slot - lo) as u128; // 0 if current is the lower
+    let weighted_span = (existing_lp as u128) * existing_span + (new_lp as u128) * current_span;
+    let offset = weighted_span / total_lp;
+    // Mathematically offset <= max_span <= u64::MAX - lo, so `lo + offset` never
+    // wraps. Use saturating_add anyway: it makes panic-freedom obvious without
+    // the solver having to reason about the magnitude of a symbolic division,
+    // and it fails safe (clamps to u64::MAX) rather than panicking even if some
+    // future caller violated the invariant.
+    lo.saturating_add(offset as u64)
 }
 
 #[cfg(test)]
@@ -281,24 +350,96 @@ mod tests {
 
     #[test]
     fn test_flush_available_normal() {
-        assert_eq!(flush_available(1000, 200, 300), 500);
+        // deposited - withdrawn - flushed (no returns) = 1000 - 200 - 300 = 500
+        assert_eq!(flush_available(1000, 0, 200, 300), 500);
     }
 
     #[test]
     fn test_flush_available_overdrawn() {
         // withdrawn > deposited → saturates to 0
-        assert_eq!(flush_available(100, 200, 0), 0);
+        assert_eq!(flush_available(100, 0, 200, 0), 0);
     }
 
     #[test]
     fn test_flush_available_fully_flushed() {
-        assert_eq!(flush_available(1000, 200, 800), 0);
+        assert_eq!(flush_available(1000, 0, 200, 800), 0);
     }
 
     #[test]
     fn test_flush_available_over_flushed() {
         // More flushed than available → saturates to 0
-        assert_eq!(flush_available(1000, 200, 900), 0);
+        assert_eq!(flush_available(1000, 0, 200, 900), 0);
+    }
+
+    #[test]
+    fn test_flush_available_returned_is_reflushable() {
+        // #9 regression: deposit 1000, flush 500, then 300 returned from
+        // insurance into the vault. The vault physically holds 1000-500+300=800.
+        // The old formula (deposited - withdrawn - flushed) returned only 500
+        // and left the returned 300 permanently un-flushable. With returns
+        // counted, available = 1000 + 300 - 0 - 500 = 800.
+        assert_eq!(flush_available(1000, 300, 0, 500), 800);
+    }
+
+    #[test]
+    fn test_flush_available_full_return_restores_capacity() {
+        // Flush everything (500), get all 500 back → fully re-flushable again.
+        assert_eq!(flush_available(500, 500, 0, 500), 500);
+    }
+
+    // ── Weighted deposit slot (#8) ──
+
+    #[test]
+    fn test_weighted_slot_first_deposit_is_current() {
+        // No existing position → anchor exactly to the current slot.
+        assert_eq!(weighted_deposit_slot(0, 0, 1_000, 5_000), 5_000);
+    }
+
+    #[test]
+    fn test_weighted_slot_zero_lp_both_sides() {
+        // Degenerate: no LP at all → current slot (no div-by-zero).
+        assert_eq!(weighted_deposit_slot(0, 100, 0, 5_000), 5_000);
+    }
+
+    #[test]
+    fn test_weighted_slot_tiny_topup_barely_moves_large_aged_position() {
+        // Large aged position (1_000_000 LP @ slot 0) + tiny top-up (1 LP @ slot
+        // 1_000_000). Weighted slot ≈ (1_000_000*0 + 1*1_000_000)/1_000_001 = 0
+        // (rounds down). The huge aged position is NOT re-locked.
+        let s = weighted_deposit_slot(1_000_000, 0, 1, 1_000_000);
+        assert_eq!(s, 0, "tiny top-up must not re-lock a large aged position");
+    }
+
+    #[test]
+    fn test_weighted_slot_large_fresh_deposit_pulls_toward_now() {
+        // Small aged position (1 LP @ slot 0) + large fresh deposit
+        // (1_000_000 LP @ slot 1_000_000). Weighted slot ≈ 999_999 — the
+        // cooldown still meaningfully covers the new funds.
+        let s = weighted_deposit_slot(1, 0, 1_000_000, 1_000_000);
+        assert_eq!(s, 999_999);
+    }
+
+    #[test]
+    fn test_weighted_slot_equal_weights_is_midpoint() {
+        // Equal LP on each side → midpoint of the two slots.
+        assert_eq!(weighted_deposit_slot(500, 100, 500, 300), 200);
+    }
+
+    #[test]
+    fn test_weighted_slot_within_bounds_and_never_future() {
+        // Result is always within [min, max] of the two slots, so it can never
+        // be in the future relative to current_slot.
+        let existing_slot = 1_000u64;
+        let current_slot = 4_000u64;
+        let s = weighted_deposit_slot(123, existing_slot, 456, current_slot);
+        assert!(s >= existing_slot && s <= current_slot);
+    }
+
+    #[test]
+    fn test_weighted_slot_no_overflow_at_u64_max() {
+        // Extreme magnitudes must not panic/overflow (u128 intermediates).
+        let s = weighted_deposit_slot(u64::MAX, u64::MAX, u64::MAX, u64::MAX);
+        assert_eq!(s, u64::MAX);
     }
 
     // ── Rounding Direction ──

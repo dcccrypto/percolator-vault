@@ -20,6 +20,7 @@
 mod kani_proofs {
     use percolator_vault::math::{
         calc_collateral_for_withdraw, calc_lp_for_deposit, flush_available, pool_value,
+        weighted_deposit_slot,
     };
 
     // ═══════════════════════════════════════════════════════════
@@ -176,9 +177,32 @@ mod kani_proofs {
     #[kani::proof]
     fn proof_flush_available_no_panic() {
         let deposited: u64 = kani::any();
+        let returned: u64 = kani::any();
         let withdrawn: u64 = kani::any();
         let flushed: u64 = kani::any();
-        let _ = flush_available(deposited, withdrawn, flushed);
+        let _ = flush_available(deposited, returned, withdrawn, flushed);
+    }
+
+    /// PROOF (#8): weighted_deposit_slot never panics over the FULL u64 input
+    /// space — no add/sub/mul overflow and no divide-by-zero (the total_lp == 0
+    /// case is short-circuited). This is the safety-critical property: a panic
+    /// in the deposit path would brick deposits.
+    ///
+    /// The "result stays within [min(slot), max(slot)]" RANGE property is proven
+    /// by the exhaustive-edge unit tests in tests/unit.rs / src/math.rs
+    /// (`test_weighted_slot_*`), not here: that assertion forces CBMC to reason
+    /// about a division by the symbolic divisor `total_lp`, which — like the
+    /// unbounded 64-bit multiplications noted in the module header — is
+    /// SAT-intractable. Panic-freedom does not require resolving the division
+    /// result, so it stays fast and unbounded.
+    #[kani::proof]
+    fn proof_weighted_deposit_slot_no_panic() {
+        let existing_lp: u64 = kani::any();
+        let existing_slot: u64 = kani::any();
+        let new_lp: u64 = kani::any();
+        let current_slot: u64 = kani::any();
+
+        let _ = weighted_deposit_slot(existing_lp, existing_slot, new_lp, current_slot);
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -311,31 +335,42 @@ mod kani_proofs {
     // 5. Flush Bounds
     // ═══════════════════════════════════════════════════════════
 
-    /// PROOF: flush_available ≤ deposited (can't flush more than total).
+    /// PROOF: flush_available ≤ deposited + returned (can't flush more than the
+    /// collateral that has ever physically been in the vault). Returned
+    /// insurance is real vault collateral, so it raises the flushable ceiling.
     #[kani::proof]
     fn proof_flush_bounded_by_deposited() {
         let deposited: u64 = kani::any();
+        let returned: u64 = kani::any();
         let withdrawn: u64 = kani::any();
         let flushed: u64 = kani::any();
+        // Bound inputs so deposited + returned does not overflow u64; the real
+        // accounting can never have lifetime inflows exceeding u64::MAX.
+        kani::assume(deposited <= u64::MAX / 2);
+        kani::assume(returned <= u64::MAX / 2);
 
-        let avail = flush_available(deposited, withdrawn, flushed);
-        assert!(avail <= deposited);
+        let avail = flush_available(deposited, returned, withdrawn, flushed);
+        assert!(avail <= deposited.saturating_add(returned));
     }
 
     /// PROOF: After flushing available amount, flush_available = 0.
     #[kani::proof]
     fn proof_flush_max_then_zero() {
         let deposited: u64 = kani::any();
+        let returned: u64 = kani::any();
         let withdrawn: u64 = kani::any();
         let flushed: u64 = kani::any();
 
-        kani::assume(withdrawn <= deposited);
-        kani::assume(flushed <= deposited.saturating_sub(withdrawn));
+        kani::assume(deposited <= u64::MAX / 2);
+        kani::assume(returned <= u64::MAX / 2);
+        let inflows = deposited.saturating_add(returned);
+        kani::assume(withdrawn <= inflows);
+        kani::assume(flushed <= inflows.saturating_sub(withdrawn));
 
-        let avail = flush_available(deposited, withdrawn, flushed);
+        let avail = flush_available(deposited, returned, withdrawn, flushed);
         let new_flushed = flushed + avail;
 
-        let remaining = flush_available(deposited, withdrawn, new_flushed);
+        let remaining = flush_available(deposited, returned, withdrawn, new_flushed);
         assert_eq!(remaining, 0);
     }
 

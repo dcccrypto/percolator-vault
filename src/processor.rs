@@ -454,9 +454,21 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     deposit.bump = deposit_bump;
     deposit.pool = pool_pda.key.to_bytes();
     deposit.user = user.key.to_bytes();
-    deposit.last_deposit_slot = clock.slot;
-    deposit.lp_amount = deposit
-        .lp_amount
+
+    // #8 fix: do NOT reset last_deposit_slot to clock.slot unconditionally.
+    // That would re-lock the depositor's ENTIRE existing aged position under
+    // the withdrawal cooldown — a tiny top-up could freeze a large, long-aged
+    // position for the full cooldown again (a griefing / accidental-lockout
+    // vector). Instead, blend the existing position's age with the new deposit,
+    // weighted by LP amount, so a small top-up barely moves the unlock slot
+    // while a large fresh deposit is still meaningfully covered by the cooldown
+    // (anti-flash protection preserved). For a brand-new record (existing
+    // lp_amount == 0) this returns exactly clock.slot.
+    let existing_lp = deposit.lp_amount;
+    let existing_slot = deposit.last_deposit_slot;
+    deposit.last_deposit_slot =
+        crate::math::weighted_deposit_slot(existing_lp, existing_slot, lp_to_mint, clock.slot);
+    deposit.lp_amount = existing_lp
         .checked_add(lp_to_mint)
         .ok_or(StakeError::Overflow)?;
 
@@ -710,12 +722,23 @@ fn process_flush_to_insurance(
         return Err(StakeError::InvalidPercolatorProgram.into());
     }
 
-    // Verify vault balance — can't flush more than what's available in vault
-    // Available = total_deposited - total_withdrawn - total_flushed
-    // Use checked_sub for defense-in-depth (saturating_sub hides accounting bugs)
+    // Verify vault balance — can't flush more than what's physically in vault.
+    // Available = total_deposited + total_returned - total_withdrawn - total_flushed
+    //
+    // #9 fix: total_returned (insurance pulled back into the vault after
+    // resolution via AdminWithdrawInsurance) is real collateral sitting in the
+    // stake vault. The previous formula omitted it, so any returned insurance
+    // was permanently un-flushable even though the tokens were in the vault and
+    // counted toward total_pool_value(). Add returned to the inflows so the
+    // flush ceiling matches the vault's true balance.
+    //
+    // Sum the positive inflows BEFORE subtracting the negatives so a legitimate
+    // intermediate state cannot underflow mid-computation. Use checked_* for
+    // defense-in-depth (saturating_sub would hide a genuine accounting bug).
     let available = pool
         .total_deposited
-        .checked_sub(pool.total_withdrawn)
+        .checked_add(pool.total_returned)
+        .and_then(|v| v.checked_sub(pool.total_withdrawn))
         .and_then(|v| v.checked_sub(pool.total_flushed))
         .ok_or(StakeError::Overflow)?;
     if amount > available {
