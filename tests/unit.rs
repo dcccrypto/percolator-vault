@@ -238,13 +238,20 @@ fn test_accrual_baseline_mode1_fee_appreciated_does_not_brick_crank() {
     // Still solvent → reports the remainder; matches total_pool_value when no flush/return.
     pool.total_fees_earned = 1_500_000;
     assert_eq!(pool.accrual_baseline(), Some(500_000));
-    assert_eq!(pool.accrual_baseline(), pool.total_pool_value(),
-        "with no flush/return, accrual baseline equals total_pool_value");
+    assert_eq!(
+        pool.accrual_baseline(),
+        pool.total_pool_value(),
+        "with no flush/return, accrual baseline equals total_pool_value"
+    );
 
     // Fails closed on a genuinely over-withdrawn state (negatives exceed positives).
     pool.total_fees_earned = 0;
     pool.total_withdrawn = 2_000_000; // 1M deposited + 0 fees < 2M withdrawn
-    assert_eq!(pool.accrual_baseline(), None, "truly over-withdrawn state still fails closed");
+    assert_eq!(
+        pool.accrual_baseline(),
+        None,
+        "truly over-withdrawn state still fails closed"
+    );
 }
 
 #[test]
