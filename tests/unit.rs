@@ -238,13 +238,20 @@ fn test_accrual_baseline_mode1_fee_appreciated_does_not_brick_crank() {
     // Still solvent → reports the remainder; matches total_pool_value when no flush/return.
     pool.total_fees_earned = 1_500_000;
     assert_eq!(pool.accrual_baseline(), Some(500_000));
-    assert_eq!(pool.accrual_baseline(), pool.total_pool_value(),
-        "with no flush/return, accrual baseline equals total_pool_value");
+    assert_eq!(
+        pool.accrual_baseline(),
+        pool.total_pool_value(),
+        "with no flush/return, accrual baseline equals total_pool_value"
+    );
 
     // Fails closed on a genuinely over-withdrawn state (negatives exceed positives).
     pool.total_fees_earned = 0;
     pool.total_withdrawn = 2_000_000; // 1M deposited + 0 fees < 2M withdrawn
-    assert_eq!(pool.accrual_baseline(), None, "truly over-withdrawn state still fails closed");
+    assert_eq!(
+        pool.accrual_baseline(),
+        None,
+        "truly over-withdrawn state still fails closed"
+    );
 }
 
 #[test]
@@ -292,6 +299,142 @@ fn test_flush_available_zero_when_fully_flushed() {
         .saturating_sub(pool.total_withdrawn)
         .saturating_sub(pool.total_flushed);
     assert_eq!(available, 0);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// #9: returned insurance is re-flushable (FlushToInsurance available formula)
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_flush_available_includes_returned_insurance() {
+    // Mirrors the corrected FlushToInsurance `available` formula:
+    // available = deposited + returned - withdrawn - flushed.
+    //
+    // Lifecycle: deposit 1000, flush 500 to insurance, then 300 is returned to
+    // the vault after resolution. The vault now physically holds
+    // 1000 - 500 + 300 = 800 collateral. The OLD formula
+    // (deposited - withdrawn - flushed = 500) made the returned 300 permanently
+    // un-flushable. The corrected formula must expose all 800.
+    let mut pool = new_pool();
+    pool.total_deposited = 1000;
+    pool.total_flushed = 500;
+    pool.total_withdrawn = 0;
+    pool.total_returned = 300;
+
+    let available = pool
+        .total_deposited
+        .checked_add(pool.total_returned)
+        .and_then(|v| v.checked_sub(pool.total_withdrawn))
+        .and_then(|v| v.checked_sub(pool.total_flushed))
+        .unwrap();
+
+    assert_eq!(
+        available, 800,
+        "returned insurance sitting in the vault must be re-flushable"
+    );
+    // And it equals what total_pool_value() reports as the vault balance for a
+    // mode-0 (insurance) pool — the two views are consistent.
+    assert_eq!(available, pool.total_pool_value().unwrap());
+}
+
+// ═══════════════════════════════════════════════════════════════
+// #8: deposit cooldown — stake-weighted-average last_deposit_slot
+// ═══════════════════════════════════════════════════════════════
+
+/// Replicates the exact StakeDeposit update that process_deposit performs on a
+/// top-up, then exercises the withdraw cooldown gate against the resulting
+/// slot. Proves a tiny top-up onto a large aged position does NOT re-lock the
+/// whole position for the full cooldown.
+#[test]
+fn test_topup_does_not_relock_large_aged_position() {
+    use percolator_vault::math::weighted_deposit_slot;
+
+    let cooldown_slots: u64 = 1_000;
+
+    // Large aged position: 1_000_000 LP deposited at slot 0, cooldown already
+    // long elapsed by the time of the top-up.
+    let mut deposit = StakeDeposit::zeroed();
+    deposit.is_initialized = 1;
+    deposit.lp_amount = 1_000_000;
+    deposit.last_deposit_slot = 0;
+
+    // Tiny top-up of 1 LP at slot 10_000 (well past the cooldown for the
+    // original deposit).
+    let topup_slot: u64 = 10_000;
+    let topup_lp: u64 = 1;
+
+    // ── exact processor update sequence (#8 fix) ──
+    let existing_lp = deposit.lp_amount;
+    let existing_slot = deposit.last_deposit_slot;
+    deposit.last_deposit_slot =
+        weighted_deposit_slot(existing_lp, existing_slot, topup_lp, topup_slot);
+    deposit.lp_amount = existing_lp.checked_add(topup_lp).unwrap();
+
+    // Weighted slot rounds down to ~0 (the 1-LP top-up is negligible), so the
+    // position remains immediately withdrawable — NOT re-locked for 1000 slots.
+    assert_eq!(deposit.last_deposit_slot, 0);
+
+    // Cooldown gate (same comparison as process_withdraw): a withdraw at the
+    // top-up slot is allowed because the unlock slot did not jump forward.
+    let unlock_at = deposit.last_deposit_slot.saturating_add(cooldown_slots);
+    assert!(
+        topup_slot >= unlock_at,
+        "tiny top-up must not re-lock the aged position under the cooldown"
+    );
+}
+
+/// The OLD (buggy) behavior, kept as a contrast assertion: unconditionally
+/// resetting last_deposit_slot to the current slot WOULD have re-locked the
+/// whole aged position. Documents what the fix prevents.
+#[test]
+fn test_old_unconditional_reset_would_have_relocked() {
+    let cooldown_slots: u64 = 1_000;
+    let topup_slot: u64 = 10_000;
+
+    // OLD code: deposit.last_deposit_slot = clock.slot;
+    let old_last_slot = topup_slot;
+    let unlock_at = old_last_slot.saturating_add(cooldown_slots);
+
+    // The whole position would be locked until slot 11_000 — a full cooldown
+    // after a 1-LP top-up. This is exactly the lockout the #8 fix removes.
+    assert!(
+        topup_slot < unlock_at,
+        "old unconditional reset re-locked the entire position (the bug)"
+    );
+    assert_eq!(unlock_at, 11_000);
+}
+
+/// A large fresh deposit onto a small aged position still pulls the unlock slot
+/// forward, so the cooldown meaningfully covers the new funds (anti-flash
+/// protection preserved — the fix does not weaken the cooldown's purpose).
+#[test]
+fn test_large_fresh_deposit_still_covered_by_cooldown() {
+    use percolator_vault::math::weighted_deposit_slot;
+
+    let cooldown_slots: u64 = 1_000;
+
+    let mut deposit = StakeDeposit::zeroed();
+    deposit.is_initialized = 1;
+    deposit.lp_amount = 1; // negligible aged position
+    deposit.last_deposit_slot = 0;
+
+    let deposit_slot: u64 = 10_000;
+    let new_lp: u64 = 1_000_000;
+
+    let existing_lp = deposit.lp_amount;
+    let existing_slot = deposit.last_deposit_slot;
+    deposit.last_deposit_slot =
+        weighted_deposit_slot(existing_lp, existing_slot, new_lp, deposit_slot);
+    deposit.lp_amount = existing_lp.checked_add(new_lp).unwrap();
+
+    // Weighted slot ≈ 9_999 → unlock at ≈ 10_999, so an immediate withdraw at
+    // slot 10_000 is still blocked by the cooldown.
+    let unlock_at = deposit.last_deposit_slot.saturating_add(cooldown_slots);
+    assert!(
+        deposit_slot < unlock_at,
+        "a large fresh deposit must remain locked for ~the full cooldown"
+    );
+    assert_eq!(deposit.last_deposit_slot, 9_999);
 }
 
 // ═══════════════════════════════════════════════════════════════
