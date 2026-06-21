@@ -255,6 +255,49 @@ fn test_accrual_baseline_mode1_fee_appreciated_does_not_brick_crank() {
 }
 
 #[test]
+fn test_mode1_flush_would_strand_later_fees_below_flushed_amount() {
+    // PoC for the FlushToInsurance mode guard: mode-1 trading pools accrue
+    // fees by comparing the actual vault token balance to
+    // `accrual_baseline()`. That baseline intentionally does not include
+    // `total_flushed`, so a trading pool that is allowed to flush principal can
+    // receive real fees that remain invisible to AccrueFees until they exceed
+    // the flushed amount.
+    let mut pool = new_pool();
+    pool.pool_mode = 1;
+    pool.total_deposited = 1_000;
+    pool.total_lp_supply = 1_000;
+
+    // Admin-triggered FlushToInsurance records 500 flushed principal and
+    // physically moves the vault balance from 1000 to 500.
+    pool.total_flushed = 500;
+    let vault_balance_after_flush = 500u64;
+    assert_eq!(pool.total_pool_value(), Some(500));
+
+    // A later 100-token fee arrives in the trading vault. The vault physically
+    // holds 600, but AccrueFees compares against a 1000-token baseline and
+    // books nothing.
+    let vault_balance_after_fee = vault_balance_after_flush + 100;
+    let accrual_baseline = pool.accrual_baseline().unwrap();
+    assert_eq!(accrual_baseline, 1_000);
+    assert!(vault_balance_after_fee < accrual_baseline);
+
+    let fee_delta_booked_by_accrue_fees = if vault_balance_after_fee > accrual_baseline {
+        vault_balance_after_fee - accrual_baseline
+    } else {
+        0
+    };
+    assert_eq!(
+        fee_delta_booked_by_accrue_fees, 0,
+        "the 100 real vault tokens are not booked as fees"
+    );
+    assert_eq!(
+        vault_balance_after_fee - pool.total_pool_value().unwrap(),
+        100,
+        "the extra 100 tokens are physically present but absent from pool accounting"
+    );
+}
+
+#[test]
 fn test_pool_value_underflow_returns_zero() {
     let mut pool = new_pool();
     pool.total_deposited = 100;
