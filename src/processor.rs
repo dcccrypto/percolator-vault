@@ -1238,18 +1238,25 @@ fn process_admin_set_hwm_config(
         return Err(StakeError::Unauthorized.into());
     }
 
-    // Validate floor bps: 0–10000 (0% to 100%)
-    if hwm_floor_bps > 10_000 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-
     pool.set_hwm_enabled(enabled);
-    pool.set_hwm_floor_bps(hwm_floor_bps);
+
+    // Only write floor_bps when ENABLING. Disabling must preserve the stored floor
+    // so that a subsequent re-enable recovers the prior value without an explicit
+    // reconfiguration. Writing it unconditionally meant a disable call (floor=0,
+    // validation skipped) silently clobbered the stored floor; re-enabling later
+    // then started with floor=0 — no HWM protection. Mirrors percolator-stake #185.
+    if enabled {
+        // floor_bps must be 1-10000; 0 means "always pass" which defeats the purpose.
+        if hwm_floor_bps == 0 || hwm_floor_bps > 10_000 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        pool.set_hwm_floor_bps(hwm_floor_bps);
+    }
 
     msg!(
         "AdminSetHwmConfig: enabled={}, floor_bps={}",
         enabled,
-        hwm_floor_bps
+        pool.hwm_floor_bps()
     );
     Ok(())
 }
