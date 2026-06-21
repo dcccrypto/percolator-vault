@@ -837,44 +837,52 @@ fn process_transfer_admin(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
         return Err(ProgramError::MissingRequiredSignature);
     }
 
-    let mut pool_data = pool_pda.try_borrow_mut_data()?;
-    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
-
-    if pool.is_initialized != 1 {
-        return Err(StakeError::NotInitialized.into());
-    }
-    // M7: Verify caller is pool admin (defense-in-depth).
-    // The wrapper CPI will also check, but we should reject early if the
-    // caller isn't even our admin — prevents non-admin from triggering
-    // admin transfer on wrapper if they happen to be the wrapper admin.
-    if pool.admin != current_admin.key.to_bytes() {
-        return Err(StakeError::Unauthorized.into());
-    }
-    if pool.admin_transferred == 1 {
-        return Err(StakeError::AdminAlreadyTransferred.into());
-    }
-    if pool.slab != slab.key.to_bytes() {
-        return Err(StakeError::InvalidPda.into());
-    }
-    if pool.percolator_program != percolator_program.key.to_bytes() {
-        return Err(StakeError::InvalidPercolatorProgram.into());
-    }
-
     // Verify the pool PDA is correctly derived
-    let (expected_pool, _) = state::derive_pool_pda(program_id, slab.key);
+    let (expected_pool, pool_bump) = state::derive_pool_pda(program_id, slab.key);
     if *pool_pda.key != expected_pool {
         return Err(StakeError::InvalidPda.into());
     }
 
-    // CPI UpdateAdmin: current_admin signs, sets new admin = pool PDA
-    // The current_admin must be the signer of the outer transaction
-    // and must currently be the wrapper slab's admin.
-    cpi::cpi_update_admin(
+    {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+
+        if pool.is_initialized != 1 {
+            return Err(StakeError::NotInitialized.into());
+        }
+        // M7: Verify caller is pool admin (defense-in-depth).
+        // The wrapper CPI will also check, but we should reject early if the
+        // caller isn't even our admin.
+        if pool.admin != current_admin.key.to_bytes() {
+            return Err(StakeError::Unauthorized.into());
+        }
+        if pool.admin_transferred == 1 {
+            return Err(StakeError::AdminAlreadyTransferred.into());
+        }
+        if pool.slab != slab.key.to_bytes() {
+            return Err(StakeError::InvalidPda.into());
+        }
+        if pool.percolator_program != percolator_program.key.to_bytes() {
+            return Err(StakeError::InvalidPercolatorProgram.into());
+        }
+    }
+
+    // Current wrapper ABI: UpdateAuthority (tag 32) requires BOTH the current
+    // market authority and the incoming authority to sign. The incoming
+    // authority is this program's pool PDA, so the vault program must co-sign it
+    // via invoke_signed.
+    let pool_bump_arr = [pool_bump];
+    let pool_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &pool_bump_arr];
+    cpi::cpi_update_authority(
         percolator_program,
         current_admin,
+        pool_pda,
         slab,
-        pool_pda.key, // new admin = pool PDA
+        pool_seeds,
     )?;
+
+    let mut pool_data = pool_pda.try_borrow_mut_data()?;
+    let pool: &mut StakePool = bytemuck::from_bytes_mut(&mut pool_data[..STAKE_POOL_SIZE]);
 
     pool.admin_transferred = 1;
 
@@ -901,19 +909,30 @@ fn process_admin_set_oracle_authority(
     let pool_pda = next_account_info(accounts_iter)?;
     let slab = next_account_info(accounts_iter)?;
     let percolator_program = next_account_info(accounts_iter)?;
+    let new_authority_ai = next_account_info(accounts_iter)?;
+
+    if new_authority_ai.key != new_authority {
+        return Err(StakeError::InvalidAccount.into());
+    }
+    if !new_authority_ai.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
 
     let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
-    let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
+    let bump_arr = [bump];
+    let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &bump_arr];
 
-    cpi::cpi_set_oracle_authority(
+    cpi::cpi_update_asset_authority(
         percolator_program,
         pool_pda,
+        new_authority_ai,
         slab,
-        new_authority,
-        admin_seeds,
+        0,
+        cpi::ASSET_AUTH_ORACLE,
+        &[admin_seeds],
     )?;
 
-    msg!("SetOracleAuthority forwarded via CPI");
+    msg!("Asset-0 oracle authority rotated via CPI");
     Ok(())
 }
 
@@ -936,16 +955,14 @@ fn process_admin_set_risk_threshold(
     let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
+    msg!("SetRiskThreshold has no current wrapper CPI equivalent");
     cpi::cpi_set_risk_threshold(
         percolator_program,
         pool_pda,
         slab,
         new_threshold,
         admin_seeds,
-    )?;
-
-    msg!("SetRiskThreshold forwarded via CPI");
-    Ok(())
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -967,10 +984,8 @@ fn process_admin_set_maintenance_fee(
     let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
 
-    cpi::cpi_set_maintenance_fee(percolator_program, pool_pda, slab, new_fee, admin_seeds)?;
-
-    msg!("SetMaintenanceFee forwarded via CPI");
-    Ok(())
+    msg!("SetMaintenanceFee has no current wrapper CPI equivalent");
+    cpi::cpi_set_maintenance_fee(percolator_program, pool_pda, slab, new_fee, admin_seeds)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1021,7 +1036,7 @@ fn process_admin_withdraw_insurance(
     let wrapper_vault_pda = next_account_info(accounts_iter)?; // wrapper's vault authority PDA
     let percolator_program = next_account_info(accounts_iter)?;
     let token_program = next_account_info(accounts_iter)?;
-    let clock = next_account_info(accounts_iter)?;
+    let _clock = next_account_info(accounts_iter)?; // retained for backward-compatible account layout
 
     // Validate admin authority
     let pool_bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
@@ -1037,20 +1052,17 @@ fn process_admin_withdraw_insurance(
 
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
 
-    // CPI: WithdrawInsuranceLimited (wrapper Tag 31)
-    // - vault_auth is the policy authority (set via AdminSetInsurancePolicy / wrapper Tag 30 beforehand)
-    // - stake_vault is owned by vault_auth → passes verify_token_account check
-    // - Requires market to be RESOLVED + all positions closed
-    // - Requires SetInsuranceWithdrawPolicy called first with vault_auth as authority
-    cpi::cpi_withdraw_insurance_limited(
+    // Current wrapper ABI: terminal WithdrawInsurance (tag 41). vault_auth is
+    // the asset-0 insurance authority (configured through AdminSetInsurancePolicy
+    // below) and stake_vault is its destination token account.
+    cpi::cpi_withdraw_insurance(
         percolator_program,
         vault_auth,
         slab,
         stake_vault,
         wrapper_vault,
-        token_program,
         wrapper_vault_pda,
-        clock,
+        token_program,
         amount,
         vault_auth_seeds,
     )?;
@@ -1090,22 +1102,61 @@ fn process_admin_set_insurance_policy(
     let pool_pda = next_account_info(accounts_iter)?;
     let slab = next_account_info(accounts_iter)?;
     let percolator_program = next_account_info(accounts_iter)?;
+    let authority_ai = next_account_info(accounts_iter)?;
+
+    if authority_ai.key != authority {
+        return Err(StakeError::InvalidAccount.into());
+    }
+
+    // The current wrapper removed the old bps/cooldown policy setter. Keep this
+    // instruction as the standalone vault setup hook for the only authority it
+    // needs: asset-0 insurance authority. Nonzero legacy policy fields would be
+    // silently ignored, so fail closed instead.
+    if min_withdraw_base != 0 || max_withdraw_bps != 0 || cooldown_slots != 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
 
     let bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
-    let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[bump]];
+    let bump_arr = [bump];
+    let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &bump_arr];
 
-    cpi::cpi_set_insurance_withdraw_policy(
-        percolator_program,
-        pool_pda,
-        slab,
-        authority,
-        min_withdraw_base,
-        max_withdraw_bps,
-        cooldown_slots,
-        admin_seeds,
-    )?;
+    if authority_ai.is_signer {
+        cpi::cpi_update_asset_authority(
+            percolator_program,
+            pool_pda,
+            authority_ai,
+            slab,
+            0,
+            cpi::ASSET_AUTH_INSURANCE,
+            &[admin_seeds],
+        )?;
+    } else {
+        // Common setup path: rotate asset-0 insurance authority to this vault's
+        // vault_auth PDA so it can sign TopUpInsurance and terminal
+        // WithdrawInsurance while owning the stake vault token account.
+        let (expected_vault_auth, vault_auth_bump) =
+            state::derive_vault_authority(program_id, pool_pda.key);
+        if *authority_ai.key != expected_vault_auth {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+        let vault_auth_bump_arr = [vault_auth_bump];
+        let vault_auth_seeds: &[&[u8]] = &[
+            b"vault_auth",
+            pool_pda.key.as_ref(),
+            &vault_auth_bump_arr,
+        ];
+        cpi::cpi_update_asset_authority(
+            percolator_program,
+            pool_pda,
+            authority_ai,
+            slab,
+            0,
+            cpi::ASSET_AUTH_INSURANCE,
+            &[admin_seeds, vault_auth_seeds],
+        )?;
+    }
 
-    msg!("SetInsuranceWithdrawPolicy forwarded via CPI");
+    msg!("Asset-0 insurance authority rotated via CPI");
     Ok(())
 }
 

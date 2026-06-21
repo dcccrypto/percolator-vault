@@ -1,7 +1,8 @@
-//! CPI helpers for calling percolator wrapper instructions.
+//! CPI helpers for calling the current percolator wrapper ABI.
 //!
-//! We construct raw instruction data manually since we don't depend on percolator-prog.
-//! Instruction tags match the wrapper's Instruction::decode() in percolator.rs.
+//! We construct raw instruction data manually since this crate intentionally
+//! avoids depending on percolator-prog. Keep these tags/wire layouts aligned
+//! with dcccrypto/percolator-prog `origin/main:src/v16_program.rs`.
 #![allow(clippy::too_many_arguments)]
 
 use solana_program::{
@@ -9,56 +10,43 @@ use solana_program::{
     entrypoint::ProgramResult,
     instruction::{AccountMeta, Instruction},
     program::invoke_signed,
-    pubkey::Pubkey,
+    program_error::ProgramError,
 };
 
-// ═══════════════════════════════════════════════════════════════
-// Wrapper instruction tags (from percolator-prog/src/percolator.rs)
-// ═══════════════════════════════════════════════════════════════
+// Current wrapper instruction tags.
+pub const TAG_TOP_UP_INSURANCE: u8 = 9;
+pub const TAG_RESOLVE_MARKET: u8 = 19;
+pub const TAG_UPDATE_AUTHORITY: u8 = 32;
+pub const TAG_UPDATE_ASSET_AUTHORITY: u8 = 65;
+pub const TAG_WITHDRAW_INSURANCE: u8 = 41;
 
-const TAG_TOP_UP_INSURANCE: u8 = 9;
-const TAG_SET_RISK_THRESHOLD: u8 = 11;
-const TAG_UPDATE_ADMIN: u8 = 12;
-const TAG_SET_MAINTENANCE_FEE: u8 = 15;
-const TAG_SET_ORACLE_AUTHORITY: u8 = 16;
-const TAG_SET_ORACLE_PRICE_CAP: u8 = 18;
-const TAG_RESOLVE_MARKET: u8 = 19;
-const TAG_WITHDRAW_INSURANCE: u8 = 20;
-// Tag 21 = AdminForceCloseAccount (not used by stake program)
-// Tag 22 = UpdateRiskParams (not used by stake program)
-// Tag 23 = RenounceAdmin (not used by stake program)
-// Tag 24 = CreateInsuranceMint (not used by stake program)
-// Tag 25 = DepositInsuranceLP (not used by stake program)
-// Tag 26 = WithdrawInsuranceLP (not used by stake program)
-// Tag 27 = PauseMarket (not used by stake program)
-// Tag 28 = UnpauseMarket (not used by stake program)
-// Tag 29 = AcceptAdmin (two-step admin transfer, added in PERC-112)
-//
-// Tags 30 and 31 were added to percolator-launch in PERC-110.
-// Previous values of 22/23 were WRONG — they would have called UpdateRiskParams
-// and RenounceAdmin respectively, which is catastrophically incorrect.
-const TAG_SET_INSURANCE_WITHDRAW_POLICY: u8 = 30;
-const TAG_WITHDRAW_INSURANCE_LIMITED: u8 = 31;
+// Current wrapper asset-authority kind values.
+pub const ASSET_AUTH_INSURANCE: u8 = 1;
+pub const ASSET_AUTH_ORACLE: u8 = 4;
+
+fn push_u128_from_u64(out: &mut Vec<u8>, amount: u64) {
+    out.extend_from_slice(&(amount as u128).to_le_bytes());
+}
 
 // ═══════════════════════════════════════════════════════════════
-// TopUpInsurance (Tag 9) — permissionless, anyone can top up
+// TopUpInsurance (tag 9)
 // ═══════════════════════════════════════════════════════════════
-// Accounts: [signer, slab(w), signer_ata, vault, token_program]
-// Data: tag(1) + amount(8)
+// Accounts: [authority(signer), market(w), source_token(w), vault_token(w), token_program]
+// Data: tag(1) + amount(16)
 
 pub fn cpi_top_up_insurance<'a>(
     percolator_program: &AccountInfo<'a>,
-    signer: &AccountInfo<'a>, // vault_auth PDA (we sign)
+    signer: &AccountInfo<'a>, // vault_auth PDA once asset-0 insurance authority is rotated
     slab: &AccountInfo<'a>,
-    signer_ata: &AccountInfo<'a>, // stake vault (owned by vault_auth)
+    signer_ata: &AccountInfo<'a>, // stake vault, owned by vault_auth
     wrapper_vault: &AccountInfo<'a>,
     token_program: &AccountInfo<'a>,
     amount: u64,
     signer_seeds: &[&[u8]],
 ) -> ProgramResult {
-    let mut data = Vec::with_capacity(9);
+    let mut data = Vec::with_capacity(17);
     data.push(TAG_TOP_UP_INSURANCE);
-    data.extend_from_slice(&amount.to_le_bytes());
+    push_u128_from_u64(&mut data, amount);
 
     let ix = Instruction {
         program_id: *percolator_program.key,
@@ -86,155 +74,109 @@ pub fn cpi_top_up_insurance<'a>(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// UpdateAdmin (Tag 12) — current admin transfers to new admin
+// UpdateAuthority (tag 32)
 // ═══════════════════════════════════════════════════════════════
-// Accounts: [admin(signer), slab(w)]
-// Data: tag(1) + new_admin(32)
-// Note: For TransferAdmin, the CURRENT admin (human) signs, not pool PDA.
+// Accounts: [current_authority(signer), new_authority(signer), market(w)]
+// Data: tag(1) + new_authority(32)
 
-pub fn cpi_update_admin<'a>(
+pub fn cpi_update_authority<'a>(
     percolator_program: &AccountInfo<'a>,
     current_admin: &AccountInfo<'a>,
+    new_authority: &AccountInfo<'a>,
     slab: &AccountInfo<'a>,
-    new_admin: &Pubkey,
+    new_authority_seeds: &[&[u8]],
 ) -> ProgramResult {
     let mut data = Vec::with_capacity(33);
-    data.push(TAG_UPDATE_ADMIN);
-    data.extend_from_slice(new_admin.as_ref());
+    data.push(TAG_UPDATE_AUTHORITY);
+    data.extend_from_slice(new_authority.key.as_ref());
 
     let ix = Instruction {
         program_id: *percolator_program.key,
         accounts: vec![
             AccountMeta::new_readonly(*current_admin.key, true),
+            AccountMeta::new_readonly(*new_authority.key, true),
             AccountMeta::new(*slab.key, false),
         ],
         data,
     };
 
-    // No invoke_signed — current admin (human) is the signer of the outer tx
-    solana_program::program::invoke(&ix, &[current_admin.clone(), slab.clone()])
+    invoke_signed(
+        &ix,
+        &[current_admin.clone(), new_authority.clone(), slab.clone()],
+        &[new_authority_seeds],
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SetOracleAuthority (Tag 16) — admin only
+// UpdateAssetAuthority (tag 65)
 // ═══════════════════════════════════════════════════════════════
-// Accounts: [admin(signer), slab(w)]
-// Data: tag(1) + new_authority(32)
+// Accounts: [current_authority(signer), new_authority(signer), market(w)]
+// Data: tag(1) + asset_index(2) + kind(1) + new_authority(32)
 
-pub fn cpi_set_oracle_authority<'a>(
+pub fn cpi_update_asset_authority<'a>(
     percolator_program: &AccountInfo<'a>,
-    admin_pda: &AccountInfo<'a>,
+    current_authority: &AccountInfo<'a>,
+    new_authority: &AccountInfo<'a>,
     slab: &AccountInfo<'a>,
-    new_authority: &Pubkey,
-    admin_seeds: &[&[u8]],
+    asset_index: u16,
+    kind: u8,
+    signer_seeds: &[&[&[u8]]],
 ) -> ProgramResult {
-    let mut data = Vec::with_capacity(33);
-    data.push(TAG_SET_ORACLE_AUTHORITY);
-    data.extend_from_slice(new_authority.as_ref());
+    let mut data = Vec::with_capacity(36);
+    data.push(TAG_UPDATE_ASSET_AUTHORITY);
+    data.extend_from_slice(&asset_index.to_le_bytes());
+    data.push(kind);
+    data.extend_from_slice(new_authority.key.as_ref());
 
     let ix = Instruction {
         program_id: *percolator_program.key,
         accounts: vec![
-            AccountMeta::new_readonly(*admin_pda.key, true),
+            AccountMeta::new_readonly(*current_authority.key, true),
+            AccountMeta::new_readonly(*new_authority.key, true),
             AccountMeta::new(*slab.key, false),
         ],
         data,
     };
 
-    invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])
+    invoke_signed(
+        &ix,
+        &[
+            current_authority.clone(),
+            new_authority.clone(),
+            slab.clone(),
+        ],
+        signer_seeds,
+    )
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SetRiskThreshold (Tag 11) — admin only
+// Retired wrapper admin paths
 // ═══════════════════════════════════════════════════════════════
-// Accounts: [admin(signer), slab(w)]
-// Data: tag(1) + new_threshold(16)
 
 pub fn cpi_set_risk_threshold<'a>(
-    percolator_program: &AccountInfo<'a>,
-    admin_pda: &AccountInfo<'a>,
-    slab: &AccountInfo<'a>,
-    new_threshold: u128,
-    admin_seeds: &[&[u8]],
+    _percolator_program: &AccountInfo<'a>,
+    _admin_pda: &AccountInfo<'a>,
+    _slab: &AccountInfo<'a>,
+    _new_threshold: u128,
+    _admin_seeds: &[&[u8]],
 ) -> ProgramResult {
-    let mut data = Vec::with_capacity(17);
-    data.push(TAG_SET_RISK_THRESHOLD);
-    data.extend_from_slice(&new_threshold.to_le_bytes());
-
-    let ix = Instruction {
-        program_id: *percolator_program.key,
-        accounts: vec![
-            AccountMeta::new_readonly(*admin_pda.key, true),
-            AccountMeta::new(*slab.key, false),
-        ],
-        data,
-    };
-
-    invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])
+    Err(ProgramError::InvalidInstructionData)
 }
-
-// ═══════════════════════════════════════════════════════════════
-// SetMaintenanceFee (Tag 15) — admin only
-// ═══════════════════════════════════════════════════════════════
-// Accounts: [admin(signer), slab(w)]
-// Data: tag(1) + new_fee(16)
 
 pub fn cpi_set_maintenance_fee<'a>(
-    percolator_program: &AccountInfo<'a>,
-    admin_pda: &AccountInfo<'a>,
-    slab: &AccountInfo<'a>,
-    new_fee: u128,
-    admin_seeds: &[&[u8]],
+    _percolator_program: &AccountInfo<'a>,
+    _admin_pda: &AccountInfo<'a>,
+    _slab: &AccountInfo<'a>,
+    _new_fee: u128,
+    _admin_seeds: &[&[u8]],
 ) -> ProgramResult {
-    let mut data = Vec::with_capacity(17);
-    data.push(TAG_SET_MAINTENANCE_FEE);
-    data.extend_from_slice(&new_fee.to_le_bytes());
-
-    let ix = Instruction {
-        program_id: *percolator_program.key,
-        accounts: vec![
-            AccountMeta::new_readonly(*admin_pda.key, true),
-            AccountMeta::new(*slab.key, false),
-        ],
-        data,
-    };
-
-    invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])
+    Err(ProgramError::InvalidInstructionData)
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SetOraclePriceCap (Tag 18) — admin only
+// ResolveMarket (tag 19)
 // ═══════════════════════════════════════════════════════════════
-// Accounts: [admin(signer), slab(w)]
-// Data: tag(1) + max_change_e2bps(8)
-
-pub fn cpi_set_oracle_price_cap<'a>(
-    percolator_program: &AccountInfo<'a>,
-    admin_pda: &AccountInfo<'a>,
-    slab: &AccountInfo<'a>,
-    max_change_e2bps: u64,
-    admin_seeds: &[&[u8]],
-) -> ProgramResult {
-    let mut data = Vec::with_capacity(9);
-    data.push(TAG_SET_ORACLE_PRICE_CAP);
-    data.extend_from_slice(&max_change_e2bps.to_le_bytes());
-
-    let ix = Instruction {
-        program_id: *percolator_program.key,
-        accounts: vec![
-            AccountMeta::new_readonly(*admin_pda.key, true),
-            AccountMeta::new(*slab.key, false),
-        ],
-        data,
-    };
-
-    invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])
-}
-
-// ═══════════════════════════════════════════════════════════════
-// ResolveMarket (Tag 19) — admin only, ends market
-// ═══════════════════════════════════════════════════════════════
-// Accounts: [admin(signer), slab(w)]
+// Accounts: [admin(signer), market(w)]
 // Data: tag(1)
 
 pub fn cpi_resolve_market<'a>(
@@ -258,121 +200,36 @@ pub fn cpi_resolve_market<'a>(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// WithdrawInsurance (Tag 20) — admin only, requires RESOLVED
+// WithdrawInsurance (tag 41)
 // ═══════════════════════════════════════════════════════════════
-// Accounts: [admin(signer), slab(w), admin_ata(w), vault(w), token_program, vault_pda]
-// Data: tag(1)
+// Accounts: [authority(signer), market(w), dest_token(w), vault_token(w),
+//            wrapper_vault_authority, token_program]
+// Data: tag(1) + amount(16)
 
 pub fn cpi_withdraw_insurance<'a>(
     percolator_program: &AccountInfo<'a>,
-    admin_pda: &AccountInfo<'a>,
+    authority: &AccountInfo<'a>, // vault_auth PDA after asset-0 insurance authority is rotated
     slab: &AccountInfo<'a>,
-    admin_ata: &AccountInfo<'a>, // ATA owned by admin PDA to receive insurance
+    dest_token: &AccountInfo<'a>, // stake vault, owned by vault_auth
     wrapper_vault: &AccountInfo<'a>,
+    wrapper_vault_authority: &AccountInfo<'a>,
     token_program: &AccountInfo<'a>,
-    vault_authority: &AccountInfo<'a>, // wrapper's vault authority PDA
-    admin_seeds: &[&[u8]],
-) -> ProgramResult {
-    let data = vec![TAG_WITHDRAW_INSURANCE];
-
-    let ix = Instruction {
-        program_id: *percolator_program.key,
-        accounts: vec![
-            AccountMeta::new_readonly(*admin_pda.key, true),
-            AccountMeta::new(*slab.key, false),
-            AccountMeta::new(*admin_ata.key, false),
-            AccountMeta::new(*wrapper_vault.key, false),
-            AccountMeta::new_readonly(*token_program.key, false),
-            AccountMeta::new_readonly(*vault_authority.key, false),
-        ],
-        data,
-    };
-
-    invoke_signed(
-        &ix,
-        &[
-            admin_pda.clone(),
-            slab.clone(),
-            admin_ata.clone(),
-            wrapper_vault.clone(),
-            token_program.clone(),
-            vault_authority.clone(),
-        ],
-        &[admin_seeds],
-    )
-}
-
-// ═══════════════════════════════════════════════════════════════
-// SetInsuranceWithdrawPolicy (Tag 21) — admin only, requires RESOLVED
-// ═══════════════════════════════════════════════════════════════
-// Accounts: [admin(signer), slab(w)]
-// Data: tag(1) + authority(32) + min_withdraw_base(8) + max_withdraw_bps(2) + cooldown_slots(8)
-
-pub fn cpi_set_insurance_withdraw_policy<'a>(
-    percolator_program: &AccountInfo<'a>,
-    admin_pda: &AccountInfo<'a>,
-    slab: &AccountInfo<'a>,
-    authority: &Pubkey,
-    min_withdraw_base: u64,
-    max_withdraw_bps: u16,
-    cooldown_slots: u64,
-    admin_seeds: &[&[u8]],
-) -> ProgramResult {
-    let mut data = Vec::with_capacity(51);
-    data.push(TAG_SET_INSURANCE_WITHDRAW_POLICY);
-    data.extend_from_slice(authority.as_ref());
-    data.extend_from_slice(&min_withdraw_base.to_le_bytes());
-    data.extend_from_slice(&max_withdraw_bps.to_le_bytes());
-    data.extend_from_slice(&cooldown_slots.to_le_bytes());
-
-    let ix = Instruction {
-        program_id: *percolator_program.key,
-        accounts: vec![
-            AccountMeta::new_readonly(*admin_pda.key, true),
-            AccountMeta::new(*slab.key, false),
-        ],
-        data,
-    };
-
-    invoke_signed(&ix, &[admin_pda.clone(), slab.clone()], &[admin_seeds])
-}
-
-// ═══════════════════════════════════════════════════════════════
-// WithdrawInsuranceLimited (Tag 22) — policy authority, requires RESOLVED
-// ═══════════════════════════════════════════════════════════════
-// Accounts (7): [authority(signer), slab(w), authority_ata(w), vault(w),
-//                token_program, vault_pda, clock]
-// Data: tag(1) + amount(8)
-//
-// KEY: authority_ata must be a token account owned by authority.
-// We set vault_auth as the policy authority (via SetInsuranceWithdrawPolicy),
-// so vault_auth signs here and stake_vault (owned by vault_auth) is authority_ata.
-pub fn cpi_withdraw_insurance_limited<'a>(
-    percolator_program: &AccountInfo<'a>,
-    vault_auth: &AccountInfo<'a>, // policy authority (signer via PDA seeds)
-    slab: &AccountInfo<'a>,
-    stake_vault: &AccountInfo<'a>, // authority_ata — owned by vault_auth ✓
-    wrapper_vault: &AccountInfo<'a>, // insurance vault (writable)
-    token_program: &AccountInfo<'a>,
-    wrapper_vault_pda: &AccountInfo<'a>, // wrapper's vault PDA authority
-    clock: &AccountInfo<'a>,
     amount: u64,
-    vault_auth_seeds: &[&[u8]], // [b"vault_auth", pool_pda_key, bump_byte]
+    authority_seeds: &[&[u8]],
 ) -> ProgramResult {
-    let mut data = Vec::with_capacity(9);
-    data.push(TAG_WITHDRAW_INSURANCE_LIMITED);
-    data.extend_from_slice(&amount.to_le_bytes());
+    let mut data = Vec::with_capacity(17);
+    data.push(TAG_WITHDRAW_INSURANCE);
+    push_u128_from_u64(&mut data, amount);
 
     let ix = Instruction {
         program_id: *percolator_program.key,
         accounts: vec![
-            AccountMeta::new_readonly(*vault_auth.key, true), // authority (signer via PDA)
-            AccountMeta::new(*slab.key, false),               // slab (writable, NOT signer)
-            AccountMeta::new(*stake_vault.key, false), // authority_ata (writable, NOT signer)
-            AccountMeta::new(*wrapper_vault.key, false), // insurance vault (writable, NOT signer)
+            AccountMeta::new_readonly(*authority.key, true),
+            AccountMeta::new(*slab.key, false),
+            AccountMeta::new(*dest_token.key, false),
+            AccountMeta::new(*wrapper_vault.key, false),
+            AccountMeta::new_readonly(*wrapper_vault_authority.key, false),
             AccountMeta::new_readonly(*token_program.key, false),
-            AccountMeta::new_readonly(*wrapper_vault_pda.key, false),
-            AccountMeta::new_readonly(*clock.key, false),
         ],
         data,
     };
@@ -380,14 +237,13 @@ pub fn cpi_withdraw_insurance_limited<'a>(
     invoke_signed(
         &ix,
         &[
-            vault_auth.clone(),
+            authority.clone(),
             slab.clone(),
-            stake_vault.clone(),
+            dest_token.clone(),
             wrapper_vault.clone(),
+            wrapper_vault_authority.clone(),
             token_program.clone(),
-            wrapper_vault_pda.clone(),
-            clock.clone(),
         ],
-        &[vault_auth_seeds],
+        &[authority_seeds],
     )
 }

@@ -83,9 +83,12 @@ pub enum StakeInstruction {
         new_deposit_cap: Option<u64>,
     },
 
-    /// Transfer wrapper slab admin authority to the pool PDA.
+    /// Transfer wrapper market authority to the pool PDA.
     /// One-time setup — the current wrapper admin (human) must sign.
     /// After this, the pool PDA IS the admin and can CPI admin instructions.
+    ///
+    /// Current wrapper ABI: CPIs `UpdateAuthority` (tag 32), so the pool PDA
+    /// also co-signs as the incoming authority via invoke_signed.
     ///
     /// Accounts:
     ///   0. `[signer]` Current wrapper admin (human)
@@ -94,7 +97,7 @@ pub enum StakeInstruction {
     ///   3. `[]` Percolator program
     TransferAdmin,
 
-    /// Pool admin forwards SetOracleAuthority to wrapper via CPI.
+    /// Pool admin rotates asset-0 oracle authority on the wrapper via CPI.
     /// Pool PDA signs as wrapper admin.
     ///
     /// Accounts:
@@ -102,9 +105,11 @@ pub enum StakeInstruction {
     ///   1. `[]` Pool PDA (wrapper admin, signs CPI)
     ///   2. `[writable]` Slab account
     ///   3. `[]` Percolator program
+    ///   4. `[signer]` New oracle authority (current wrapper requires co-sign)
     AdminSetOracleAuthority { new_authority: Pubkey },
 
-    /// Pool admin forwards SetRiskThreshold to wrapper via CPI.
+    /// Legacy wire slot retained for compatibility. The current wrapper ABI no
+    /// longer exposes a direct SetRiskThreshold CPI, so processing fails closed.
     ///
     /// Accounts:
     ///   0. `[signer]` Pool admin
@@ -113,7 +118,8 @@ pub enum StakeInstruction {
     ///   3. `[]` Percolator program
     AdminSetRiskThreshold { new_threshold: u128 },
 
-    /// Pool admin forwards SetMaintenanceFee to wrapper via CPI.
+    /// Legacy wire slot retained for compatibility. The current wrapper ABI no
+    /// longer exposes a direct SetMaintenanceFee CPI, so processing fails closed.
     ///
     /// Accounts:
     ///   0. `[signer]` Pool admin
@@ -145,17 +151,26 @@ pub enum StakeInstruction {
     ///   7. `[]` Percolator program
     ///   8. `[]` Token program
     ///
-    /// 10: AdminWithdrawInsurance — CPIs WithdrawInsuranceLimited (wrapper Tag 31) via vault_auth PDA.
-    /// Requires market RESOLVED and SetInsuranceWithdrawPolicy (wrapper Tag 30) called with vault_auth as authority.
+    /// Current wrapper ABI: CPIs terminal WithdrawInsurance (tag 41) via
+    /// vault_auth PDA. Requires the market to be resolved/terminal and asset-0
+    /// insurance authority to have been rotated to vault_auth.
     AdminWithdrawInsurance { amount: u64 },
 
-    /// Pool admin sets insurance withdrawal policy on wrapper.
+    /// Pool admin rotates asset-0 insurance authority on the wrapper.
+    ///
+    /// Current wrapper ABI removed the old bps/cooldown policy setter. This
+    /// instruction keeps the legacy wire shape but requires all legacy policy
+    /// fields to be zero and uses `authority` as the new asset-0 insurance
+    /// authority. If `authority` is the vault_auth PDA, this program co-signs it
+    /// via invoke_signed; otherwise the authority account must be a transaction
+    /// signer.
     ///
     /// Accounts:
     ///   0. `[signer]` Pool admin
     ///   1. `[]` Pool PDA (wrapper admin, signs CPI)
     ///   2. `[writable]` Slab account
     ///   3. `[]` Percolator program
+    ///   4. `[signer]` New insurance authority or vault_auth PDA
     AdminSetInsurancePolicy {
         authority: Pubkey,
         min_withdraw_base: u64,

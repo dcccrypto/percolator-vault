@@ -25,7 +25,7 @@ The vault program manages two types of LP pools per market (slab):
 │  • LP deposit / withdraw with cooldown           │
 │  • Insurance flush (vault → wrapper insurance)   │
 │  • Fee accrual (trading LP mode)                 │
-│  • Admin forwarding (oracle, risk, fees)         │
+│  • Current wrapper CPI admin/setup hooks         │
 │  • Epoch accounting                              │
 └──────────────────────────────────────────────────┘
 ```
@@ -33,7 +33,7 @@ The vault program manages two types of LP pools per market (slab):
 The vault PDA becomes the **admin** of the percolator wrapper slab. This means:
 - The wrapper stays thin (pure perp math) — auditable in isolation
 - Policy logic (caps, cooldowns, fee distribution) lives here
-- Admin operations (set oracle, risk thresholds) are forwarded via CPI with PDA signature
+- Supported admin/setup operations are forwarded via the current wrapper CPI ABI with PDA signatures
 
 ### Instructions
 
@@ -44,13 +44,13 @@ The vault PDA becomes the **admin** of the percolator wrapper slab. This means:
 | 2 | `Withdraw` | Burn LP tokens → withdraw collateral (after cooldown) |
 | 3 | `FlushToInsurance` | CPI TopUpInsurance — move vault funds → wrapper insurance |
 | 4 | `UpdateConfig` | Admin updates cooldown period, deposit caps |
-| 5 | `TransferAdmin` | One-time: transfer wrapper admin to pool PDA |
-| 6 | `AdminSetOracleAuth` | CPI SetOracleAuthority on wrapper |
-| 7 | `AdminSetRiskThreshold` | CPI SetRiskThreshold on wrapper |
-| 8 | `AdminSetMaintenanceFee` | CPI SetMaintenanceFee on wrapper |
+| 5 | `TransferAdmin` | One-time: transfer wrapper admin to pool PDA via `UpdateAuthority` |
+| 6 | `AdminSetOracleAuth` | Rotate wrapper asset-0 oracle authority via `UpdateAssetAuthority` |
+| 7 | `AdminSetRiskThreshold` | Legacy slot; no current wrapper CPI equivalent, fails closed |
+| 8 | `AdminSetMaintenanceFee` | Legacy slot; no current wrapper CPI equivalent, fails closed |
 | 9 | `AdminResolveMarket` | CPI ResolveMarket (end-of-epoch) |
 | 10 | `AdminWithdrawInsurance` | CPI WithdrawInsurance → distribute to LPs |
-| 11 | `AdminSetInsurancePolicy` | CPI SetInsuranceWithdrawPolicy on wrapper |
+| 11 | `AdminSetInsurancePolicy` | Rotate wrapper asset-0 insurance authority; legacy policy fields must be zero |
 | 12 | `AccrueFees` | Permissionless crank — accrues trading fees into vault |
 | 13 | `InitTradingPool` | Create a trading LP pool (mode 1) |
 
