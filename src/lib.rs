@@ -16,7 +16,7 @@
 //! - LP tokens represent proportional ownership of pool (vault + flushed to insurance)
 //! - FlushToInsurance: CPI into wrapper's TopUpInsurance to fund insurance
 //! - AccrueFees: Permissionless crank accrues trading fees into vault (mode 1)
-//! - Admin operations (set oracle, risk thresholds) forwarded via CPI with PDA signature
+//! - Supported admin/setup operations forwarded via current wrapper CPI with PDA signatures
 //! - Wrapper stays thin (pure perp math) — policy logic lives here
 //! - Security audits isolated: audit wrapper for math, audit this for policy
 //!
@@ -26,13 +26,13 @@
 //!   2 - Withdraw:                Burn LP tokens → withdraw from vault (after cooldown)
 //!   3 - FlushToInsurance:        CPI TopUpInsurance — vault → wrapper insurance fund
 //!   4 - UpdateConfig:            Admin updates cooldown, caps, etc.
-//!   5 - TransferAdmin:           Transfer wrapper slab admin to pool PDA (one-time setup)
-//!   6 - AdminSetOracleAuth:      CPI SetOracleAuthority on wrapper
-//!   7 - AdminSetRiskThreshold:   CPI SetRiskThreshold on wrapper
-//!   8 - AdminSetMaintenanceFee:  CPI SetMaintenanceFee on wrapper
+//!   5 - TransferAdmin:           Transfer wrapper slab admin to pool PDA via UpdateAuthority
+//!   6 - AdminSetOracleAuth:      Rotate asset-0 oracle authority via UpdateAssetAuthority
+//!   7 - AdminSetRiskThreshold:   Legacy slot; current wrapper has no direct CPI equivalent
+//!   8 - AdminSetMaintenanceFee:  Legacy slot; current wrapper has no direct CPI equivalent
 //!   9 - AdminResolveMarket:      CPI ResolveMarket on wrapper (end-of-epoch)
 //!  10 - AdminWithdrawInsurance:   CPI WithdrawInsurance → distribute to LP holders
-//!  11 - AdminSetInsurancePolicy:  CPI SetInsuranceWithdrawPolicy on wrapper
+//!  11 - AdminSetInsurancePolicy:  Rotate asset-0 insurance authority; legacy policy fields zero
 //!  12 - AccrueFees:               Permissionless crank — accrues trading fees
 //!  13 - InitTradingPool:          Create trading LP pool (mode 1)
 
