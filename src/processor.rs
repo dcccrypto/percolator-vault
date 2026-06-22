@@ -267,14 +267,16 @@ fn process_init_pool(
         &[pool_seeds],
     )?;
 
-    // Create LP mint (authority = vault_auth PDA)
+    // Create LP mint (authority = vault_auth PDA, freeze authority = None).
+    // Retaining a freeze authority would let vault_auth freeze any LP holder's ATA,
+    // permanently blocking withdrawals. LP must always be redeemable.
     let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &[vault_auth_bump]];
     invoke_signed(
         &spl_token::instruction::initialize_mint(
             token_program.key,
             lp_mint.key,
             vault_auth.key,
-            Some(vault_auth.key),
+            None,
             6,
         )?,
         &[lp_mint.clone(), rent_sysvar.clone()],
