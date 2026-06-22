@@ -94,6 +94,58 @@ pub fn process(
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Helper: squatting-safe PDA creation
+// ═══════════════════════════════════════════════════════════════
+
+/// Create a program-owned PDA account, tolerating a pre-funded (squatted) address.
+///
+/// An attacker can send 1 lamport to any deterministic PDA before it is ever created.
+/// The system program's `create_account` rejects accounts that already have lamports
+/// (`AccountAlreadyInUse`), permanently blocking first-use. This helper detects the
+/// squatted case and finishes the creation via separate `allocate` + `assign` calls
+/// instead, so the create always succeeds regardless of pre-existing balance.
+fn create_or_adopt_pda<'a>(
+    target: &AccountInfo<'a>,
+    payer: &AccountInfo<'a>,
+    system_program: &AccountInfo<'a>,
+    owner: &Pubkey,
+    space: usize,
+    signer_seeds: &[&[u8]],
+) -> ProgramResult {
+    let rent = Rent::get()?;
+    let need = rent.minimum_balance(space);
+
+    if target.lamports() == 0 {
+        invoke_signed(
+            &system_instruction::create_account(payer.key, target.key, need, space as u64, owner),
+            &[payer.clone(), target.clone(), system_program.clone()],
+            &[signer_seeds],
+        )?;
+        return Ok(());
+    }
+
+    // Pre-funded (squatted): finish creation manually.
+    let have = target.lamports();
+    if have < need {
+        invoke(
+            &system_instruction::transfer(payer.key, target.key, need - have),
+            &[payer.clone(), target.clone(), system_program.clone()],
+        )?;
+    }
+    invoke_signed(
+        &system_instruction::allocate(target.key, space as u64),
+        &[target.clone(), system_program.clone()],
+        &[signer_seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(target.key, owner),
+        &[target.clone(), system_program.clone()],
+        &[signer_seeds],
+    )?;
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Helper: read pool, validate, return admin seeds
 // ═══════════════════════════════════════════════════════════════
 
@@ -441,17 +493,16 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
             user.key.as_ref(),
             &[deposit_bump],
         ];
-        let rent = Rent::get()?;
-        invoke_signed(
-            &system_instruction::create_account(
-                user.key,
-                deposit_pda.key,
-                rent.minimum_balance(STAKE_DEPOSIT_SIZE),
-                STAKE_DEPOSIT_SIZE as u64,
-                program_id,
-            ),
-            &[user.clone(), deposit_pda.clone(), system_program.clone()],
-            &[deposit_seeds],
+        // Use squatting-safe creation: a griefer pre-funding the PDA with 1 lamport
+        // would make a bare create_account fail with AccountAlreadyInUse, permanently
+        // locking out this user's deposits. create_or_adopt_pda handles that case.
+        create_or_adopt_pda(
+            deposit_pda,
+            user,
+            system_program,
+            program_id,
+            STAKE_DEPOSIT_SIZE,
+            deposit_seeds,
         )?;
     }
 
