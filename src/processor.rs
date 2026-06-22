@@ -139,6 +139,18 @@ fn validate_admin_cpi(
     Ok(bump)
 }
 
+/// FlushToInsurance moves idle insurance-pool liquidity into the wrapper's
+/// insurance fund. Trading LP pools use vault-balance deltas for fee accrual,
+/// so allowing them to flush principal makes AccrueFees compare against the
+/// wrong baseline and can strand later fees below the flushed amount.
+fn validate_flush_pool_mode(pool: &StakePool) -> ProgramResult {
+    if pool.pool_mode != 0 {
+        msg!("FlushToInsurance: pool is not an insurance LP pool");
+        return Err(StakeError::InvalidPoolMode.into());
+    }
+    Ok(())
+}
+
 // ═══════════════════════════════════════════════════════════════
 // 0: InitPool
 // ═══════════════════════════════════════════════════════════════
@@ -703,6 +715,7 @@ fn process_flush_to_insurance(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
+    validate_flush_pool_mode(pool)?;
 
     // CRITICAL (C10): FlushToInsurance must be admin-only.
     // Without this, ANY signer can drain the stake vault to wrapper insurance,
@@ -1303,4 +1316,29 @@ fn process_admin_set_hwm_config(
         hwm_floor_bps
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::Zeroable;
+
+    #[test]
+    fn flush_pool_mode_guard_allows_insurance_pools() {
+        let mut pool = StakePool::zeroed();
+        pool.pool_mode = 0;
+
+        assert!(validate_flush_pool_mode(&pool).is_ok());
+    }
+
+    #[test]
+    fn flush_pool_mode_guard_rejects_trading_pools() {
+        let mut pool = StakePool::zeroed();
+        pool.pool_mode = 1;
+
+        assert_eq!(
+            validate_flush_pool_mode(&pool).unwrap_err(),
+            StakeError::InvalidPoolMode.into()
+        );
+    }
 }
