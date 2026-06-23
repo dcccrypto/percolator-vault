@@ -203,6 +203,19 @@ fn validate_flush_pool_mode(pool: &StakePool) -> ProgramResult {
     Ok(())
 }
 
+/// Ensure returned insurance is sent to the canonical pool vault.
+///
+/// AdminWithdrawInsurance updates `total_returned`, so the CPI destination must
+/// be the vault tracked in pool state. Otherwise accounting can report returned
+/// value that the real pool vault never received.
+fn validate_return_vault(pool: &StakePool, stake_vault_key: &Pubkey) -> ProgramResult {
+    if pool.vault != stake_vault_key.to_bytes() {
+        msg!("AdminWithdrawInsurance: destination is not pool vault");
+        return Err(StakeError::InvalidPda.into());
+    }
+    Ok(())
+}
+
 // ═══════════════════════════════════════════════════════════════
 // 0: InitPool
 // ═══════════════════════════════════════════════════════════════
@@ -1108,6 +1121,14 @@ fn process_admin_withdraw_insurance(
     let pool_bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let _ = pool_bump; // pool_pda not signing this CPI
 
+    // Returned insurance must land in the canonical pool vault before
+    // `total_returned` is incremented.
+    {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        validate_return_vault(pool, stake_vault.key)?;
+    }
+
     // Derive vault_auth PDA and its seeds
     // vault_auth = PDA([b"vault_auth", pool_pda])
     let (expected_vault_auth, vault_auth_bump) =
@@ -1206,11 +1227,8 @@ fn process_admin_set_insurance_policy(
             return Err(ProgramError::MissingRequiredSignature);
         }
         let vault_auth_bump_arr = [vault_auth_bump];
-        let vault_auth_seeds: &[&[u8]] = &[
-            b"vault_auth",
-            pool_pda.key.as_ref(),
-            &vault_auth_bump_arr,
-        ];
+        let vault_auth_seeds: &[&[u8]] =
+            &[b"vault_auth", pool_pda.key.as_ref(), &vault_auth_bump_arr];
         cpi::cpi_update_asset_authority(
             percolator_program,
             pool_pda,
@@ -1382,6 +1400,29 @@ fn process_admin_set_hwm_config(
 mod tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    #[test]
+    fn return_vault_guard_accepts_pool_vault() {
+        let vault = Pubkey::new_unique();
+        let mut pool = StakePool::zeroed();
+        pool.vault = vault.to_bytes();
+
+        assert!(validate_return_vault(&pool, &vault).is_ok());
+    }
+
+    #[test]
+    fn return_vault_guard_rejects_non_pool_vault() {
+        let canonical_vault = Pubkey::new_unique();
+        let wrong_vault = Pubkey::new_unique();
+
+        let mut pool = StakePool::zeroed();
+        pool.vault = canonical_vault.to_bytes();
+
+        assert_eq!(
+            validate_return_vault(&pool, &wrong_vault).unwrap_err(),
+            StakeError::InvalidPda.into()
+        );
+    }
 
     #[test]
     fn flush_pool_mode_guard_allows_insurance_pools() {

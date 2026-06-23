@@ -21,7 +21,10 @@ fn test_cpi_tag_update_authority_replaces_retired_update_admin() {
     let data = build_cpi_data_update_authority();
     assert_eq!(data[0], TAG_UPDATE_AUTHORITY);
     assert_eq!(data.len(), 33);
-    assert_ne!(data[0], 12, "tag 12 UpdateAdmin is retired in the current wrapper");
+    assert_ne!(
+        data[0], 12,
+        "tag 12 UpdateAdmin is retired in the current wrapper"
+    );
 }
 
 #[test]
