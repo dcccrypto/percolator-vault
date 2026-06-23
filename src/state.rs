@@ -207,7 +207,8 @@ impl StakePool {
     // Bytes 12-15: reserved padding
     // Bytes 16-23: epoch_high_water_tvl (u64 LE)
     // Bytes 24-31: hwm_last_epoch (u64 LE)
-    // Bytes 32-63: free
+    // Bytes 32-39: pre_supply_vault_offset (u64 LE)
+    // Bytes 40-63: free
     // ════════════════════════════════════════════════════════════
 
     /// Whether this market has been resolved (blocks further deposits).
@@ -269,6 +270,20 @@ impl StakePool {
     /// Set last HWM epoch.
     pub fn set_hwm_last_epoch(&mut self, epoch: u64) {
         self._reserved[24..32].copy_from_slice(&epoch.to_le_bytes());
+    }
+
+    /// Vault balance observed while LP supply was zero.
+    ///
+    /// This excludes direct vault dust that arrived before the first LP deposit from
+    /// later fee accrual. Without this offset, the next AccrueFees after bootstrap
+    /// would treat pre-supply dust as fees for the first LP holder.
+    pub fn pre_supply_vault_offset(&self) -> u64 {
+        u64::from_le_bytes(self._reserved[32..40].try_into().unwrap())
+    }
+
+    /// Set pre-supply vault offset.
+    pub fn set_pre_supply_vault_offset(&mut self, amount: u64) {
+        self._reserved[32..40].copy_from_slice(&amount.to_le_bytes());
     }
 
     /// Refresh HWM tracking for a new epoch. If current epoch differs from
