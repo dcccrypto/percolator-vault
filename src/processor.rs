@@ -1292,6 +1292,20 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 
     let clock = Clock::from_account_info(clock_ai)?;
 
+    // A zero-LP trading pool must stay bootstrap-able.
+    // If direct token dust lands in the vault before the first LP deposit,
+    // permissionless AccrueFees must not book it as fees, otherwise
+    // total_pool_value becomes non-zero while total_lp_supply is still zero.
+    // That state bricks the first legitimate deposit because deposits into
+    // orphaned value are intentionally blocked.
+    if pool.total_lp_supply == 0 {
+        msg!("AccrueFees: no LP supply; skipping fee accrual");
+        pool.set_pre_supply_vault_offset(current_balance);
+        pool.last_fee_accrual_slot = clock.slot;
+        pool.last_vault_snapshot = current_balance;
+        return Ok(());
+    }
+
     // Compute fee delta: any balance increase beyond the accrual baseline
     // (total_deposited + total_fees_earned - total_withdrawn) is new fees.
     // Routed through StakePool::accrual_baseline, which sums positives before
@@ -1299,7 +1313,10 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
     // total_withdrawn legitimately exceeds total_deposited) does NOT underflow
     // and revert this permissionless crank forever. Still fails closed (None)
     // on a truly over-withdrawn state.
-    let pool_value = pool.accrual_baseline().ok_or(StakeError::Overflow)?;
+    let pool_value = pool
+        .accrual_baseline()
+        .and_then(|baseline| baseline.checked_add(pool.pre_supply_vault_offset()))
+        .ok_or(StakeError::Overflow)?;
 
     if current_balance > pool_value {
         let fee_delta = current_balance - pool_value;
@@ -1422,6 +1439,39 @@ mod tests {
             validate_return_vault(&pool, &wrong_vault).unwrap_err(),
             StakeError::InvalidPda.into()
         );
+    }
+
+    #[test]
+    fn test_pre_supply_vault_offset_excludes_zero_lp_dust_from_later_accrual() {
+        let mut pool = StakePool::zeroed();
+        pool.is_initialized = 1;
+        pool.pool_mode = 1;
+        pool.total_lp_supply = 0;
+        pool.total_deposited = 0;
+        pool.total_withdrawn = 0;
+        pool.total_fees_earned = 0;
+
+        // Dust arrives before the first LP deposit and AccrueFees records it
+        // while supply is still zero.
+        let pre_supply_dust = 1u64;
+        pool.set_pre_supply_vault_offset(pre_supply_dust);
+
+        // First legitimate LP deposit happens after the dust was observed.
+        pool.total_lp_supply = 100;
+        pool.total_deposited = 100;
+
+        // The actual vault balance includes both the real deposit and the old dust.
+        let current_balance = 101u64;
+
+        // Fee accrual baseline must include the pre-supply offset, otherwise the
+        // old dust would be incorrectly booked as fees for the first LP holder.
+        let baseline = pool
+            .accrual_baseline()
+            .and_then(|v| v.checked_add(pool.pre_supply_vault_offset()))
+            .unwrap();
+
+        assert_eq!(baseline, current_balance);
+        assert_eq!(current_balance.saturating_sub(baseline), 0);
     }
 
     #[test]
