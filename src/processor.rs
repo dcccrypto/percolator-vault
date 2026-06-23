@@ -1292,6 +1292,19 @@ fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> Progra
 
     let clock = Clock::from_account_info(clock_ai)?;
 
+    // A zero-LP trading pool must stay bootstrap-able.
+    // If direct token dust lands in the vault before the first LP deposit,
+    // permissionless AccrueFees must not book it as fees, otherwise
+    // total_pool_value becomes non-zero while total_lp_supply is still zero.
+    // That state bricks the first legitimate deposit because deposits into
+    // orphaned value are intentionally blocked.
+    if pool.total_lp_supply == 0 {
+        msg!("AccrueFees: no LP supply; skipping fee accrual");
+        pool.last_fee_accrual_slot = clock.slot;
+        pool.last_vault_snapshot = current_balance;
+        return Ok(());
+    }
+
     // Compute fee delta: any balance increase beyond the accrual baseline
     // (total_deposited + total_fees_earned - total_withdrawn) is new fees.
     // Routed through StakePool::accrual_baseline, which sums positives before
