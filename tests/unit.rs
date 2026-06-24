@@ -381,18 +381,19 @@ fn test_flush_available_includes_returned_insurance() {
 // ═══════════════════════════════════════════════════════════════
 
 /// Replicates the exact StakeDeposit update that process_deposit performs on a
-/// top-up, then exercises the withdraw cooldown gate against the resulting
-/// slot. Proves a tiny top-up onto a large aged position does NOT re-lock the
-/// whole position for a FULL extra cooldown.
+/// top-up, then exercises the withdraw cooldown gate against the resulting slot.
 ///
-/// With the #39 freshness floor, the blended slot is clamped to
-/// `current_slot - cooldown_slots` when the naive blend would be older.
-/// For a tiny 1-LP top-up onto 1_000_000 LP: the floor is
-/// `10_000 - 1_000 = 9_000`, so `last_deposit_slot` becomes 9_000 and the
-/// position unlocks at `9_000 + 1_000 = 10_000 = topup_slot` (immediately
-/// withdrawable at the top-up slot). This is correct: the tiny top-up does
-/// not re-lock for an extra cooldown period, it merely sets the unlock point
-/// to exactly now (the minimum fair bound).
+/// Proves a tiny top-up onto a large aged position does NOT re-lock the whole
+/// position for a full extra cooldown period. With the proportional floor (#39):
+///
+///   aged_credit = cooldown * existing_lp / total_lp
+///              = 1_000 * 1_000_000 / 1_000_001 = 999 (integer div)
+///   floor = 10_000 - 999 = 9_001
+///   blended (raw) = 0 → result = max(0, 9_001) = 9_001
+///   unlock_at = 9_001 + 1_000 = 10_001
+///
+/// The tiny top-up requires just 1 extra slot of wait (10_001 > 10_000), not a
+/// full extra cooldown (11_000). No griefing via tiny top-ups.
 #[test]
 fn test_topup_does_not_relock_large_aged_position() {
     use percolator_vault::math::weighted_deposit_slot;
@@ -406,8 +407,7 @@ fn test_topup_does_not_relock_large_aged_position() {
     deposit.lp_amount = 1_000_000;
     deposit.last_deposit_slot = 0;
 
-    // Tiny top-up of 1 LP at slot 10_000 (well past the cooldown for the
-    // original deposit).
+    // Tiny top-up of 1 LP at slot 10_000 (10× the cooldown past genesis).
     let topup_slot: u64 = 10_000;
     let topup_lp: u64 = 1;
 
@@ -418,19 +418,22 @@ fn test_topup_does_not_relock_large_aged_position() {
         weighted_deposit_slot(existing_lp, existing_slot, topup_lp, topup_slot, cooldown_slots);
     deposit.lp_amount = existing_lp.checked_add(topup_lp).unwrap();
 
-    // The freshness floor sets last_deposit_slot to topup_slot - cooldown_slots = 9_000.
-    // The position unlocks at exactly topup_slot (9_000 + 1_000 = 10_000).
-    // This is NOT a full re-lock (which would be 11_000); the tiny top-up only
-    // establishes the minimum freshness floor, not an extra cooldown period.
-    assert_eq!(deposit.last_deposit_slot, 9_000);
+    // Proportional floor: 10_000 - (1_000 * 1_000_000 / 1_000_001) = 10_000 - 999 = 9_001.
+    assert_eq!(deposit.last_deposit_slot, 9_001);
 
-    // Cooldown gate (same comparison as process_withdraw): a withdraw AT the
-    // top-up slot is allowed because unlock_at == topup_slot.
     let unlock_at = deposit.last_deposit_slot.saturating_add(cooldown_slots);
-    assert_eq!(unlock_at, 10_000);
+    // unlock_at = 9_001 + 1_000 = 10_001 > topup_slot (10_000).
+    // Gate (clock.slot < unlock_at → CooldownNotElapsed) fires at the topup slot.
+    assert_eq!(unlock_at, 10_001);
     assert!(
-        topup_slot >= unlock_at,
-        "tiny top-up must not re-lock the aged position beyond the current slot"
+        topup_slot < unlock_at,
+        "gate must fire at the topup slot (tiny top-up is NOT immediately withdrawable)"
+    );
+    // Critically: unlock is NOT 11_000 (a full extra cooldown re-lock). The extra wait
+    // is proportional — just 1 slot for a 1-in-1M LP top-up.
+    assert!(
+        unlock_at <= topup_slot + 2,
+        "extra wait from tiny top-up must be negligible (≤ 2 slots), not a full cooldown"
     );
 }
 
@@ -478,15 +481,17 @@ fn test_large_fresh_deposit_still_covered_by_cooldown() {
         weighted_deposit_slot(existing_lp, existing_slot, new_lp, deposit_slot, cooldown_slots);
     deposit.lp_amount = existing_lp.checked_add(new_lp).unwrap();
 
-    // Weighted slot ≈ 9_999 → unlock at ≈ 10_999, so an immediate withdraw at
-    // slot 10_000 is still blocked by the cooldown.
-    // (Floor = 10_000 - 1_000 = 9_000; blended = 9_999 > floor; result = 9_999.)
+    // Proportional floor (small aged position, large fresh deposit):
+    //   aged_credit = 1_000 * 1 / 1_000_001 = 0 (rounds down)
+    //   floor = 10_000 - 0 = 10_000
+    //   blended (raw) = 9_999; max(9_999, 10_000) = 10_000
+    //   unlock = 10_000 + 1_000 = 11_000 > 10_000 → gate fires → BLOCKED
     let unlock_at = deposit.last_deposit_slot.saturating_add(cooldown_slots);
     assert!(
         deposit_slot < unlock_at,
         "a large fresh deposit must remain locked for ~the full cooldown"
     );
-    assert_eq!(deposit.last_deposit_slot, 9_999);
+    assert_eq!(deposit.last_deposit_slot, 10_000);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -495,21 +500,21 @@ fn test_large_fresh_deposit_still_covered_by_cooldown() {
 
 /// Regression test for bounty finding #39.
 ///
-/// Without the freshness floor, a depositor who held a very old (already-unlocked)
-/// position could add a large fresh deposit and withdraw it immediately. The bypass
-/// condition was:
+/// Without the proportional floor, a depositor who held a very old position
+/// could blend a large fresh deposit and withdraw immediately. The exact bypass:
 ///
-///   new_lp / existing_lp <= (current_slot - existing_slot) / cooldown_slots - 1
+///   Pre-fix: naive blended = new_lp * current / total_lp
+///   8× bypass: 8M * 100k / 9M = 88_888; unlock = 98_888 < 100_000 → BYPASSED
+///   9× bypass: 9M * 100k / 10M = 90_000; unlock = 100_000 = current → BYPASSED
+///     (gate: clock.slot(100k) >= unlock(100k) → allows withdraw)
 ///
-/// Concrete example: existing=1_000_000 LP at slot 0, cooldown=10_000,
-/// current_slot=100_000 (10× cooldown). Any fresh deposit up to 9× the existing
-/// position (9_000_000 LP) produced a blended slot already past the cooldown,
-/// making the fresh capital immediately withdrawable.
+/// Proportional floor: aged_credit = cooldown * existing_lp / total_lp
 ///
-/// The fix clamps the blended slot to `max(blended, current_slot - cooldown_slots)`.
-/// This ensures fresh capital always faces at least one full cooldown period
-/// before it can be withdrawn, regardless of how long the existing position has
-/// been sitting.
+///   8×: aged_credit = 10k * 1M / 9M = 1_111; floor = 98_889; unlock = 108_889 → BLOCKED
+///   9×: aged_credit = 10k * 1M / 10M = 1_000; floor = 99_000; unlock = 109_000 → BLOCKED
+///
+/// Gate (processor.rs): `clock.slot < last_deposit_slot + cooldown_slots`
+/// triggers CooldownNotElapsed. Blocked = `current_slot < unlock_at` (strict).
 #[test]
 fn test_issue39_large_fresh_deposit_onto_aged_whale_is_not_immediately_withdrawable() {
     use percolator_vault::math::weighted_deposit_slot;
@@ -518,54 +523,46 @@ fn test_issue39_large_fresh_deposit_onto_aged_whale_is_not_immediately_withdrawa
     // Position aged 10× the cooldown — fully unlocked by any measure.
     let existing_lp: u64 = 1_000_000;
     let existing_slot: u64 = 0;
-    let current_slot: u64 = 100_000; // slot 0 + 100_000 = 10× cooldown
+    let current_slot: u64 = 100_000;
 
-    // Attacker deposits a large fresh amount: 8× the existing LP.
-    // Without the fix: blended = 8_000_000 * 100_000 / 9_000_000 = 88_888
-    //   unlock_at = 88_888 + 10_000 = 98_888 < 100_000 → immediately withdrawable (BYPASS).
-    // With the fix: floor = 100_000 - 10_000 = 90_000; max(88_888, 90_000) = 90_000
-    //   unlock_at = 90_000 + 10_000 = 100_000 ≤ current_slot — must still check >=.
-    // Actually at exactly 100_000 the withdraw is borderline. Use 9× (boundary case):
-    //   blended = 9_000_000 * 100_000 / 10_000_000 = 90_000; floor = 90_000 → unlocks at 100_000.
-    // Use 9× + 1 to prove the floor is strictly enforced:
-    let fresh_lp: u64 = 9_000_001; // slightly above the old bypass boundary
-
-    let blended = weighted_deposit_slot(existing_lp, existing_slot, fresh_lp, current_slot, cooldown_slots);
-    let unlock_at = blended.saturating_add(cooldown_slots);
-
-    // Floor = 100_000 - 10_000 = 90_000.
-    // Blended without floor = 9_000_001 * 100_000 / 10_000_001 = 90_000 (rounds down).
-    // max(90_000, 90_000) = 90_000; unlock = 100_000.
-    // current_slot == unlock_at → NOT strictly withdrawable yet (needs > not >=).
-    // Use a clearly-above-boundary case:
+    // ── 8× scenario (old bypass, pre-fix blended=88_888, unlock=98_888 < 100k) ──
+    let fresh_8x: u64 = 8_000_000;
+    let blended_8x = weighted_deposit_slot(existing_lp, existing_slot, fresh_8x, current_slot, cooldown_slots);
+    let unlock_8x = blended_8x.saturating_add(cooldown_slots);
+    // Proportional floor: aged_credit = 10_000 * 1M / 9M = 1_111; floor = 98_889
+    // blended = max(88_888, 98_889) = 98_889; unlock = 108_889
+    assert_eq!(blended_8x, 98_889, "8x: blended must equal proportional floor 98_889");
+    assert_eq!(unlock_8x, 108_889);
+    // Gate check (matches processor.rs:700-705 exactly):
+    // CooldownNotElapsed fires iff `clock.slot < last_deposit_slot + cooldown_slots`
     assert!(
-        current_slot <= unlock_at,
-        "fresh capital (9x the aged position) must NOT be immediately withdrawable: \
-         blended={blended}, unlock_at={unlock_at}, current_slot={current_slot}"
+        current_slot < unlock_8x,
+        "8x bypass must be blocked: current_slot({current_slot}) < unlock({unlock_8x})"
     );
 
-    // Also verify the old BYPASS scenario (8× existing LP, which was exploitable pre-fix).
-    let fresh_lp_bypass: u64 = 8_000_000;
-    let blended_bypass = weighted_deposit_slot(existing_lp, existing_slot, fresh_lp_bypass, current_slot, cooldown_slots);
-    let unlock_at_bypass = blended_bypass.saturating_add(cooldown_slots);
-    // Pre-fix: blended = 88_888, unlock = 98_888 < 100_000 → bypassed.
-    // Post-fix: floor = 90_000, unlock = 100_000 → NOT bypassed.
+    // ── 9× scenario (old bypass: blended=90_000, unlock=100_000 = current → gate passed) ──
+    let fresh_9x: u64 = 9_000_000;
+    let blended_9x = weighted_deposit_slot(existing_lp, existing_slot, fresh_9x, current_slot, cooldown_slots);
+    let unlock_9x = blended_9x.saturating_add(cooldown_slots);
+    // Proportional floor: aged_credit = 10_000 * 1M / 10M = 1_000; floor = 99_000
+    // blended = max(90_000, 99_000) = 99_000; unlock = 109_000
+    assert_eq!(blended_9x, 99_000, "9x: blended must equal proportional floor 99_000");
+    assert_eq!(unlock_9x, 109_000);
     assert!(
-        current_slot <= unlock_at_bypass,
-        "pre-fix bypass scenario (8x) must be blocked by the freshness floor: \
-         blended={blended_bypass}, unlock_at={unlock_at_bypass}, current_slot={current_slot}"
+        current_slot < unlock_9x,
+        "9x bypass must be blocked: current_slot({current_slot}) < unlock({unlock_9x})"
     );
 
-    // Prove the floor's numeric value: blended must be >= current_slot - cooldown_slots.
-    let freshness_floor = current_slot.saturating_sub(cooldown_slots);
-    assert!(
-        blended_bypass >= freshness_floor,
-        "freshness floor invariant: blended ({blended_bypass}) >= current_slot - cooldown_slots ({freshness_floor})"
-    );
-    assert!(
-        blended >= freshness_floor,
-        "freshness floor invariant: blended ({blended}) >= current_slot - cooldown_slots ({freshness_floor})"
-    );
+    // ── Proportional floor invariant: blended >= current - aged_credit ──
+    // For both cases, verify the floor was the binding constraint
+    // (i.e., blended_raw would have been lower without the floor).
+    let blended_8x_raw = {
+        // raw without floor: 8M * 100k / 9M = 88_888 (integer div)
+        (8_000_000u128 * 100_000 / 9_000_000) as u64
+    };
+    assert!(blended_8x > blended_8x_raw, "floor must have lifted the 8x blended slot");
+    let blended_9x_raw = (9_000_000u128 * 100_000 / 10_000_000) as u64; // = 90_000
+    assert!(blended_9x > blended_9x_raw, "floor must have lifted the 9x blended slot");
 }
 
 /// Complementary: a position that is NOT over-aged (existing position is younger
