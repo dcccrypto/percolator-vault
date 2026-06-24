@@ -283,20 +283,16 @@ fn process_init_pool(
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority
     verify_token_program(token_program)?;
 
-    let rent = Rent::from_account_info(rent_sysvar)?;
-
-    // Create pool PDA account
+    // Create or adopt pool PDA account. This tolerates a prefunded PDA
+    // so InitPool cannot be bricked by a 1-lamport PDA-squatting grief.
     let pool_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &[pool_bump]];
-    invoke_signed(
-        &system_instruction::create_account(
-            admin.key,
-            pool_pda.key,
-            rent.minimum_balance(STAKE_POOL_SIZE),
-            STAKE_POOL_SIZE as u64,
-            program_id,
-        ),
-        &[admin.clone(), pool_pda.clone(), system_program.clone()],
-        &[pool_seeds],
+    create_or_adopt_pda(
+        pool_pda,
+        admin,
+        system_program,
+        program_id,
+        STAKE_POOL_SIZE,
+        pool_seeds,
     )?;
 
     // Create LP mint (authority = vault_auth PDA, freeze authority = None).
