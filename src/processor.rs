@@ -203,6 +203,25 @@ fn validate_flush_pool_mode(pool: &StakePool) -> ProgramResult {
     Ok(())
 }
 
+/// AdminWithdrawInsurance must only run against insurance LP pools (pool_mode == 0).
+///
+/// On a trading LP pool (pool_mode == 1) the handler would increment
+/// `total_returned`, which `total_pool_value()` counts as positive value, while
+/// `accrual_baseline()` — used by the permissionless `AccrueFees` crank — does
+/// NOT include `total_returned`. The mismatch causes the vault balance to exceed
+/// the accrual baseline, so every subsequent `AccrueFees` call books the already-
+/// present principal as phantom fees: the same tokens are counted twice, the
+/// reported pool value exceeds real assets, and LP share-price is permanently
+/// inflated. Trading LP pools do not use the insurance flush/return lifecycle, so
+/// this instruction is insurance-only by design.
+fn validate_withdraw_insurance_pool_mode(pool: &StakePool) -> ProgramResult {
+    if pool.pool_mode != 0 {
+        msg!("AdminWithdrawInsurance: pool is not an insurance LP pool");
+        return Err(StakeError::InvalidPoolMode.into());
+    }
+    Ok(())
+}
+
 /// Ensure returned insurance is sent to the canonical pool vault.
 ///
 /// AdminWithdrawInsurance updates `total_returned`, so the CPI destination must
@@ -1121,11 +1140,17 @@ fn process_admin_withdraw_insurance(
     let pool_bump = validate_admin_cpi(program_id, pool_pda, admin, slab, percolator_program)?;
     let _ = pool_bump; // pool_pda not signing this CPI
 
-    // Returned insurance must land in the canonical pool vault before
-    // `total_returned` is incremented.
+    // Reject trading LP pools (pool_mode == 1): they never flush principal to
+    // the wrapper insurance fund, so a WithdrawInsurance CPI on them would
+    // increment `total_returned` without any corresponding prior flush. That
+    // inflates `total_pool_value()` (which includes `total_returned`) while
+    // `accrual_baseline()` (used by AccrueFees) excludes it — causing every
+    // future fee-accrual crank to double-count the returned tokens as new fees.
+    // This must be checked before the CPI and before `total_returned` is touched.
     {
         let pool_data = pool_pda.try_borrow_data()?;
         let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        validate_withdraw_insurance_pool_mode(pool)?;
         validate_return_vault(pool, stake_vault.key)?;
     }
 
