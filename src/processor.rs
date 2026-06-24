@@ -283,6 +283,12 @@ fn process_init_pool(
     // Validate token program BEFORE any invoke_signed that grants PDA signer authority
     verify_token_program(token_program)?;
 
+    // Ensure the slab is owned by the wrapper program we are about to call.
+    // This prevents validating against an arbitrary/fake percolator_program.
+    if *slab.owner != *percolator_program.key {
+        return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+
     let rent = Rent::from_account_info(rent_sysvar)?;
 
     // Create pool PDA account
@@ -298,6 +304,12 @@ fn process_init_pool(
         &[admin.clone(), pool_pda.clone(), system_program.clone()],
         &[pool_seeds],
     )?;
+
+    // Prove the initializer is the current wrapper admin by transferring
+    // wrapper admin authority to this pool PDA during initialization.
+    // If `admin` is not the current wrapper admin, the wrapper CPI fails
+    // and the pool initialization is rolled back atomically.
+    cpi::cpi_update_authority(percolator_program, admin, pool_pda, slab, pool_seeds)?;
 
     // Create LP mint (authority = vault_auth PDA, freeze authority = None).
     // Retaining a freeze authority would let vault_auth freeze any LP holder's ATA,
@@ -339,7 +351,7 @@ fn process_init_pool(
     pool.is_initialized = 1;
     pool.bump = pool_bump;
     pool.vault_authority_bump = vault_auth_bump;
-    pool.admin_transferred = 0; // Not yet — must call TransferAdmin
+    pool.admin_transferred = 1; // Wrapper admin is transferred during InitPool
     pool.slab = slab.key.to_bytes();
     pool.admin = admin.key.to_bytes();
     pool.collateral_mint = collateral_mint.key.to_bytes();
@@ -356,7 +368,7 @@ fn process_init_pool(
     pool.set_discriminator();
 
     msg!(
-        "StakePool initialized for slab {} (admin transfer pending)",
+        "StakePool initialized for slab {} (admin transferred)",
         slab.key
     );
     Ok(())
