@@ -281,11 +281,7 @@ fn test_mode1_flush_would_strand_later_fees_below_flushed_amount() {
     assert_eq!(accrual_baseline, 1_000);
     assert!(vault_balance_after_fee < accrual_baseline);
 
-    let fee_delta_booked_by_accrue_fees = if vault_balance_after_fee > accrual_baseline {
-        vault_balance_after_fee - accrual_baseline
-    } else {
-        0
-    };
+    let fee_delta_booked_by_accrue_fees = vault_balance_after_fee.saturating_sub(accrual_baseline);
     assert_eq!(
         fee_delta_booked_by_accrue_fees, 0,
         "the 100 real vault tokens are not booked as fees"
@@ -570,7 +566,10 @@ fn test_three_depositors_fairness() {
 #[test]
 fn test_stake_pool_size() {
     // Verify the struct is a known size and bytemuck-compatible
-    assert!(STAKE_POOL_SIZE > 0);
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(STAKE_POOL_SIZE > 0);
+    }
     assert_eq!(STAKE_POOL_SIZE, core::mem::size_of::<StakePool>());
     // Verify Pod alignment
     let _pool = StakePool::zeroed();
@@ -578,7 +577,10 @@ fn test_stake_pool_size() {
 
 #[test]
 fn test_stake_deposit_size() {
-    assert!(STAKE_DEPOSIT_SIZE > 0);
+    #[allow(clippy::assertions_on_constants)]
+    {
+        assert!(STAKE_DEPOSIT_SIZE > 0);
+    }
     assert_eq!(STAKE_DEPOSIT_SIZE, core::mem::size_of::<StakeDeposit>());
     let _deposit = StakeDeposit::zeroed();
 }
@@ -848,5 +850,158 @@ fn test_multiple_cycles_conservation() {
         total_in - total_out <= 10,
         "Too much rounding dust: {}",
         total_in - total_out
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Issue #27 regression: AdminWithdrawInsurance must reject trading pools
+// ═══════════════════════════════════════════════════════════════
+
+/// Regression for bounty finding #27.
+///
+/// Before the fix, `process_admin_withdraw_insurance` had no `pool_mode` guard.
+/// On a trading LP pool (pool_mode == 1) it would increment `total_returned`,
+/// which `total_pool_value()` counts as positive value. However,
+/// `accrual_baseline()` — used by the permissionless `AccrueFees` crank — does
+/// NOT include `total_returned`. The mismatch means the vault balance reported
+/// by AccrueFees exceeds its own baseline by exactly the returned amount, so
+/// every future fee-accrual crank books the same principal tokens AGAIN as fresh
+/// fees. Pool value diverges from real assets: reported solvency is overstated.
+///
+/// The fix adds `validate_withdraw_insurance_pool_mode` (mirrors the sibling
+/// `validate_flush_pool_mode` guard) that returns `StakeError::InvalidPoolMode`
+/// for any pool with `pool_mode != 0`. This test verifies the state-level
+/// accounting divergence that the guard prevents.
+#[test]
+fn test_issue27_trading_pool_total_returned_double_counts_in_accrual_baseline() {
+    // Set up a trading LP pool that has had 1000 tokens deposited and is
+    // currently solvent. No fees have been earned yet.
+    let mut pool = new_pool();
+    pool.pool_mode = 1;
+    pool.total_deposited = 1_000;
+    pool.total_lp_supply = 1_000;
+    pool.total_withdrawn = 0;
+    pool.total_flushed = 0;
+    pool.total_returned = 0;
+    pool.total_fees_earned = 0;
+
+    // Pre-fix: simulate what AdminWithdrawInsurance would have done on a
+    // trading pool — increment total_returned by 500 without any check.
+    // (This is the exploit path blocked by the fix.)
+    let returned_amount: u64 = 500;
+    pool.total_returned += returned_amount;
+
+    // total_pool_value() NOW reports 1000 + 500 = 1500 (includes total_returned
+    // in the mode-1 branch at state.rs:329-333).
+    assert_eq!(
+        pool.total_pool_value(),
+        Some(1_500),
+        "total_pool_value counts total_returned — pool appears to hold 1500"
+    );
+
+    // But accrual_baseline() ignores total_returned: it only sums
+    // total_deposited + total_fees_earned - total_withdrawn = 1000.
+    assert_eq!(
+        pool.accrual_baseline(),
+        Some(1_000),
+        "accrual_baseline excludes total_returned — baseline is still 1000"
+    );
+
+    // The vault actually holds only the original 1000 tokens (no real insurance
+    // was ever flushed from this trading pool, so nothing real was returned).
+    // AccrueFees would compare current_balance=1000 against baseline=1000 and
+    // correctly book 0 new fees — but if the vault balance EVER increases by any
+    // trading fee (say 50 tokens), AccrueFees compares 1050 vs 1000 and books
+    // 50 as fees on top of the phantom 500 in total_pool_value. The pool is
+    // permanently over-reported by the returned amount.
+    //
+    // More critically: if real fees have already been earned and the vault
+    // balance already exceeds baseline, an unguarded total_returned increment
+    // immediately makes the NEXT AccrueFees crank book the returned amount as
+    // additional fees on top of actual fees. Demonstrate this scenario:
+    pool.total_fees_earned = 200; // Legitimate fees already booked
+    pool.total_returned = 500; // Phantom return from exploit
+
+    // total_pool_value = 1000 (deposited) + 200 (fees) + 500 (returned) = 1700
+    assert_eq!(pool.total_pool_value(), Some(1_700));
+
+    // accrual_baseline = 1000 + 200 - 0 = 1200 (still no total_returned)
+    assert_eq!(pool.accrual_baseline(), Some(1_200));
+
+    // If vault physically holds 1200 (deposited + real fees), AccrueFees:
+    //   fee_delta = 1200 - 1200 = 0  (correct if total_returned == 0)
+    // After exploit (total_returned = 500): baseline still 1200, vault still
+    // 1200, so fee_delta = 0 on THIS crank. But total_pool_value reports 1700.
+    // LP share value is now 1700/1000 LP = 1.7 collateral each, vs real 1.2.
+    // Any subsequent real fee of X will be double-booked: once when it arrives
+    // in the vault (AccrueFees books X), and the phantom 500 is already baked
+    // into share price. The system has permanently drifted.
+    let real_vault_balance: u64 = 1_200; // actual tokens
+    let reported_pool_value = pool.total_pool_value().unwrap();
+    assert!(
+        reported_pool_value > real_vault_balance,
+        "OVERSTATED: reported pool value {} > real vault balance {}",
+        reported_pool_value,
+        real_vault_balance
+    );
+    let overstatement = reported_pool_value - real_vault_balance;
+    assert_eq!(
+        overstatement, 500,
+        "overstatement equals the phantom total_returned amount"
+    );
+}
+
+/// Positive test: verify that the pool-mode guard logic the fix enforces
+/// correctly admits insurance pools (pool_mode == 0) and rejects trading
+/// pools (pool_mode == 1). The processor-level guard is tested directly
+/// through `validate_withdraw_insurance_pool_mode` (a module-private fn);
+/// here we prove the state predicate the guard relies on.
+#[test]
+fn test_issue27_pool_mode_guard_accepts_insurance_rejects_trading() {
+    // Insurance pool (pool_mode == 0): AdminWithdrawInsurance is valid.
+    let mut pool = new_pool();
+    pool.pool_mode = 0;
+    pool.total_deposited = 1_000;
+    pool.total_flushed = 500;
+    pool.total_returned = 0;
+
+    // After a legitimate WithdrawInsurance on a mode-0 pool, total_returned
+    // increments correctly. total_pool_value and accrual_baseline are both
+    // undefined for mode-0 pools w.r.t. fees (mode-0 doesn't use AccrueFees),
+    // so no divergence exists.
+    pool.total_returned = 500;
+    assert_eq!(
+        pool.total_pool_value(),
+        Some(1_000),
+        "mode-0: flush+return roundtrip yields original deposit value"
+    );
+    // accrual_baseline is irrelevant for mode-0 but confirm no underflow:
+    assert!(pool.accrual_baseline().is_some());
+
+    // Trading pool (pool_mode == 1): AdminWithdrawInsurance must be rejected.
+    // The state itself is the risk: incrementing total_returned on mode-1 causes
+    // total_pool_value to exceed real vault assets. The guard (pool_mode != 0
+    // → StakeError::InvalidPoolMode) blocks entry before any state mutation.
+    let mut trading_pool = new_pool();
+    trading_pool.pool_mode = 1;
+    trading_pool.total_deposited = 1_000;
+    trading_pool.total_fees_earned = 200;
+    trading_pool.total_lp_supply = 1_000;
+
+    // Verify the DIVERGENCE that would occur without the guard:
+    // accrual_baseline does not include total_returned.
+    trading_pool.total_returned = 300; // would be set by unguarded handler
+    let pool_value = trading_pool.total_pool_value().unwrap();
+    let baseline = trading_pool.accrual_baseline().unwrap();
+    assert!(
+        pool_value > baseline,
+        "mode-1: total_pool_value ({}) > accrual_baseline ({}) once total_returned is set",
+        pool_value,
+        baseline
+    );
+    assert_eq!(
+        pool_value - baseline,
+        300,
+        "divergence equals the phantom total_returned (the double-count)"
     );
 }

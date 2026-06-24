@@ -142,9 +142,8 @@ proptest! {
         sm in 1u64..500_000_000u64,
     ) {
         let lg = sm + 1;
-        match (calc_lp_for_deposit(supply, pv, sm), calc_lp_for_deposit(supply, pv, lg)) {
-            (Some(ls), Some(ll)) => prop_assert!(ll >= ls),
-            _ => {}
+        if let (Some(ls), Some(ll)) = (calc_lp_for_deposit(supply, pv, sm), calc_lp_for_deposit(supply, pv, lg)) {
+            prop_assert!(ll >= ls)
         }
     }
 
@@ -156,9 +155,8 @@ proptest! {
     ) {
         let lg = sm + 1;
         prop_assume!(lg <= supply);
-        match (calc_collateral_for_withdraw(supply, pv, sm), calc_collateral_for_withdraw(supply, pv, lg)) {
-            (Some(cs), Some(cl)) => prop_assert!(cl >= cs),
-            _ => {}
+        if let (Some(cs), Some(cl)) = (calc_collateral_for_withdraw(supply, pv, sm), calc_collateral_for_withdraw(supply, pv, lg)) {
+            prop_assert!(cl >= cs)
         }
     }
 
