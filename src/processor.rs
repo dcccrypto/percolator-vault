@@ -600,8 +600,13 @@ fn process_deposit(program_id: &Pubkey, accounts: &[AccountInfo], amount: u64) -
     // lp_amount == 0) this returns exactly clock.slot.
     let existing_lp = deposit.lp_amount;
     let existing_slot = deposit.last_deposit_slot;
-    deposit.last_deposit_slot =
-        crate::math::weighted_deposit_slot(existing_lp, existing_slot, lp_to_mint, clock.slot);
+    deposit.last_deposit_slot = crate::math::weighted_deposit_slot(
+        existing_lp,
+        existing_slot,
+        lp_to_mint,
+        clock.slot,
+        pool.cooldown_slots,
+    );
     deposit.lp_amount = existing_lp
         .checked_add(lp_to_mint)
         .ok_or(StakeError::Overflow)?;

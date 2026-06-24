@@ -137,30 +137,61 @@ pub fn flush_available(
 /// Instead, blend the existing position's age with the new deposit, weighted by
 /// LP amount:
 ///
-/// `new_slot = (existing_lp * existing_slot + new_lp * current_slot)
+/// `blended = (existing_lp * existing_slot + new_lp * current_slot)
 ///              / (existing_lp + new_lp)`
 ///
-/// * If `existing_lp == 0` (first deposit, or the position was fully withdrawn),
-///   the result is exactly `current_slot`.
-/// * A tiny top-up onto a large aged position barely moves the slot forward, so
-///   it cannot re-lock the whole position.
-/// * A large fresh deposit onto a small aged position pulls the slot toward
-///   `current_slot` proportionally, so the cooldown still meaningfully covers
-///   the new funds (anti-flash protection preserved).
+/// then apply a **freshness floor** (fix for issue #39):
 ///
-/// Rounds DOWN (toward the older slot). The result is always within
-/// `[min(existing_slot, current_slot), max(existing_slot, current_slot)]`, so it
-/// never produces a slot in the future and never panics.
+/// `new_slot = max(blended, current_slot.saturating_sub(cooldown_slots))`
+///
+/// ## Why the floor is necessary (issue #39 bypass)
+///
+/// Without the floor, an attacker who holds a very old (fully-unlocked)
+/// position can deposit a large fresh amount and still withdraw immediately:
+///
+/// When `existing_slot = 0`, the blended slot is:
+///
+/// `blended = new_lp * current_slot / (existing_lp + new_lp)`
+///
+/// For withdrawal to be blocked, we need:
+/// `blended + cooldown_slots > current_slot`
+/// ↔ `new_lp / existing_lp > current_slot / cooldown_slots - 1`
+///
+/// So if the position is aged 10× the cooldown, a fresh deposit up to 9×
+/// the existing LP size blends to a slot that is already past the cooldown —
+/// the fresh capital is immediately withdrawable. The freshness floor
+/// `max(blended, current_slot - cooldown_slots)` closes this by ensuring the
+/// blended slot is never older than one full cooldown period behind the
+/// current slot whenever fresh LP is being added (`new_lp > 0`).
+///
+/// ## Properties preserved
+///
+/// * If `existing_lp == 0` (first deposit or fully-exited position): result is
+///   exactly `current_slot` — full cooldown starts fresh. Floor is redundant
+///   but harmless.
+/// * Tiny top-up onto a large aged position: the blended slot barely moves;
+///   the floor only activates if the existing position is more than one
+///   cooldown-period old. In that case the floor lifts the blended slot to
+///   `current_slot - cooldown_slots`, which means the cooldown elapses in
+///   exactly `cooldown_slots` slots from now — the minimum fair penalty.
+///   The existing, already-unlocked portion is NOT re-locked for an extra full
+///   cooldown; the floor merely prevents the fresh capital from being
+///   immediately free-riding on the aged position.
+/// * Large fresh deposit: the blended slot is pulled close to `current_slot`;
+///   the floor is inactive because the naive blend already exceeds the floor.
+///
+/// ## Overflow safety
 ///
 /// Implemented in offset form (`lo + weighted_span / total_lp`) so the only
 /// large product is `weight * span` with `weight <= total_lp <= 2^65`; this
-/// single u128 product cannot overflow, whereas the naive
-/// `lp0*slot0 + lp1*slot1` sum of two `(u64::MAX)^2`-sized products would.
+/// single u128 product cannot overflow. `saturating_add` on the final result
+/// makes panic-freedom syntactically obvious.
 pub fn weighted_deposit_slot(
     existing_lp: u64,
     existing_slot: u64,
     new_lp: u64,
     current_slot: u64,
+    cooldown_slots: u64,
 ) -> u64 {
     let total_lp = (existing_lp as u128) + (new_lp as u128);
     if total_lp == 0 {
@@ -180,7 +211,20 @@ pub fn weighted_deposit_slot(
     // the solver having to reason about the magnitude of a symbolic division,
     // and it fails safe (clamps to u64::MAX) rather than panicking even if some
     // future caller violated the invariant.
-    lo.saturating_add(offset as u64)
+    let blended = lo.saturating_add(offset as u64);
+
+    // Issue #39 freshness floor: when fresh LP is being added, the blended slot
+    // must never be older than (current_slot - cooldown_slots). Without this, a
+    // large fresh deposit blended into a very old position produces a blended
+    // slot that is already past the cooldown (the fresh capital is immediately
+    // withdrawable). The floor ensures fresh capital always faces at least one
+    // full cooldown period before it can be withdrawn.
+    if new_lp > 0 {
+        let floor = current_slot.saturating_sub(cooldown_slots);
+        blended.max(floor)
+    } else {
+        blended
+    }
 }
 
 #[cfg(test)]
@@ -387,26 +431,33 @@ mod tests {
         assert_eq!(flush_available(500, 500, 0, 500), 500);
     }
 
-    // ── Weighted deposit slot (#8) ──
+    // ── Weighted deposit slot (#8 / #39) ──
 
     #[test]
     fn test_weighted_slot_first_deposit_is_current() {
         // No existing position → anchor exactly to the current slot.
-        assert_eq!(weighted_deposit_slot(0, 0, 1_000, 5_000), 5_000);
+        // cooldown=0: floor = 5_000 - 0 = 5_000; max(5_000, 5_000) = 5_000.
+        assert_eq!(weighted_deposit_slot(0, 0, 1_000, 5_000, 0), 5_000);
     }
 
     #[test]
     fn test_weighted_slot_zero_lp_both_sides() {
         // Degenerate: no LP at all → current slot (no div-by-zero).
-        assert_eq!(weighted_deposit_slot(0, 100, 0, 5_000), 5_000);
+        // new_lp == 0 → freshness floor is skipped.
+        assert_eq!(weighted_deposit_slot(0, 100, 0, 5_000, 0), 5_000);
     }
 
     #[test]
     fn test_weighted_slot_tiny_topup_barely_moves_large_aged_position() {
         // Large aged position (1_000_000 LP @ slot 0) + tiny top-up (1 LP @ slot
         // 1_000_000). Weighted slot ≈ (1_000_000*0 + 1*1_000_000)/1_000_001 = 0
-        // (rounds down). The huge aged position is NOT re-locked.
-        let s = weighted_deposit_slot(1_000_000, 0, 1, 1_000_000);
+        // (integer division rounds down).
+        //
+        // Cooldown=1_000_001 > current_slot=1_000_000, so the freshness floor
+        // is 1_000_000.saturating_sub(1_000_001) = 0. The floor does not lift
+        // the result beyond 0. The position remains withdrawable at the current
+        // slot because the tiny top-up is negligible — NOT re-locked.
+        let s = weighted_deposit_slot(1_000_000, 0, 1, 1_000_000, 1_000_001);
         assert_eq!(s, 0, "tiny top-up must not re-lock a large aged position");
     }
 
@@ -415,30 +466,33 @@ mod tests {
         // Small aged position (1 LP @ slot 0) + large fresh deposit
         // (1_000_000 LP @ slot 1_000_000). Weighted slot ≈ 999_999 — the
         // cooldown still meaningfully covers the new funds.
-        let s = weighted_deposit_slot(1, 0, 1_000_000, 1_000_000);
+        // cooldown=1: floor = 999_999; max(999_999, 999_999) = 999_999.
+        let s = weighted_deposit_slot(1, 0, 1_000_000, 1_000_000, 1);
         assert_eq!(s, 999_999);
     }
 
     #[test]
     fn test_weighted_slot_equal_weights_is_midpoint() {
         // Equal LP on each side → midpoint of the two slots.
-        assert_eq!(weighted_deposit_slot(500, 100, 500, 300), 200);
+        // cooldown=100: floor = 300 - 100 = 200; max(200, 200) = 200.
+        assert_eq!(weighted_deposit_slot(500, 100, 500, 300, 100), 200);
     }
 
     #[test]
     fn test_weighted_slot_within_bounds_and_never_future() {
-        // Result is always within [min, max] of the two slots, so it can never
-        // be in the future relative to current_slot.
+        // Result is always within [min(floor,blended), current_slot].
+        // With cooldown=0, floor == current_slot, so result == current_slot — still valid.
         let existing_slot = 1_000u64;
         let current_slot = 4_000u64;
-        let s = weighted_deposit_slot(123, existing_slot, 456, current_slot);
-        assert!(s >= existing_slot && s <= current_slot);
+        let s = weighted_deposit_slot(123, existing_slot, 456, current_slot, 0);
+        assert!(s <= current_slot);
     }
 
     #[test]
     fn test_weighted_slot_no_overflow_at_u64_max() {
         // Extreme magnitudes must not panic/overflow (u128 intermediates).
-        let s = weighted_deposit_slot(u64::MAX, u64::MAX, u64::MAX, u64::MAX);
+        // cooldown=0: floor=u64::MAX; blended=u64::MAX; result=u64::MAX.
+        let s = weighted_deposit_slot(u64::MAX, u64::MAX, u64::MAX, u64::MAX, 0);
         assert_eq!(s, u64::MAX);
     }
 

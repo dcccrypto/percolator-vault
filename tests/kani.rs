@@ -201,8 +201,9 @@ mod kani_proofs {
         let existing_slot: u64 = kani::any();
         let new_lp: u64 = kani::any();
         let current_slot: u64 = kani::any();
+        let cooldown_slots: u64 = kani::any();
 
-        let _ = weighted_deposit_slot(existing_lp, existing_slot, new_lp, current_slot);
+        let _ = weighted_deposit_slot(existing_lp, existing_slot, new_lp, current_slot, cooldown_slots);
     }
 
     // ═══════════════════════════════════════════════════════════
