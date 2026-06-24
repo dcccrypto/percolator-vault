@@ -820,6 +820,8 @@ fn process_flush_to_insurance(
         return Err(StakeError::InvalidPercolatorProgram.into());
     }
 
+    verify_token_program(token_program)?;
+
     // Verify vault balance — can't flush more than what's physically in vault.
     // Available = total_deposited + total_returned - total_withdrawn - total_flushed
     //
@@ -1153,6 +1155,8 @@ fn process_admin_withdraw_insurance(
         validate_withdraw_insurance_pool_mode(pool)?;
         validate_return_vault(pool, stake_vault.key)?;
     }
+
+    verify_token_program(token_program)?;
 
     // Derive vault_auth PDA and its seeds
     // vault_auth = PDA([b"vault_auth", pool_pda])
