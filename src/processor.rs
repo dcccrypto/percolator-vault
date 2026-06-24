@@ -235,6 +235,27 @@ fn validate_return_vault(pool: &StakePool, stake_vault_key: &Pubkey) -> ProgramR
     Ok(())
 }
 
+fn validate_vault_insurance_authority(
+    program_id: &Pubkey,
+    pool_key: &Pubkey,
+    authority_key: &Pubkey,
+    requested_authority: &Pubkey,
+) -> Result<u8, ProgramError> {
+    if authority_key != requested_authority {
+        return Err(StakeError::InvalidAccount.into());
+    }
+
+    let (expected_vault_auth, vault_auth_bump) =
+        state::derive_vault_authority(program_id, pool_key);
+
+    if *authority_key != expected_vault_auth {
+        msg!("AdminSetInsurancePolicy: authority must be vault_auth PDA");
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    Ok(vault_auth_bump)
+}
+
 // ═══════════════════════════════════════════════════════════════
 // 0: InitPool
 // ═══════════════════════════════════════════════════════════════
@@ -1220,9 +1241,8 @@ fn process_admin_set_insurance_policy(
     let percolator_program = next_account_info(accounts_iter)?;
     let authority_ai = next_account_info(accounts_iter)?;
 
-    if authority_ai.key != authority {
-        return Err(StakeError::InvalidAccount.into());
-    }
+    let vault_auth_bump =
+        validate_vault_insurance_authority(program_id, pool_pda.key, authority_ai.key, authority)?;
 
     // The current wrapper removed the old bps/cooldown policy setter. Keep this
     // instruction as the standalone vault setup hook for the only authority it
@@ -1236,53 +1256,24 @@ fn process_admin_set_insurance_policy(
     let bump_arr = [bump];
     let admin_seeds: &[&[u8]] = &[b"stake_pool", slab.key.as_ref(), &bump_arr];
 
-    if authority_ai.is_signer {
-        cpi::cpi_update_asset_authority(
-            percolator_program,
-            pool_pda,
-            authority_ai,
-            slab,
-            0,
-            cpi::ASSET_AUTH_INSURANCE,
-            &[admin_seeds],
-        )?;
-    } else {
-        // Common setup path: rotate asset-0 insurance authority to this vault's
-        // vault_auth PDA so it can sign TopUpInsurance and terminal
-        // WithdrawInsurance while owning the stake vault token account.
-        let (expected_vault_auth, vault_auth_bump) =
-            state::derive_vault_authority(program_id, pool_pda.key);
-        if *authority_ai.key != expected_vault_auth {
-            return Err(ProgramError::MissingRequiredSignature);
-        }
-        let vault_auth_bump_arr = [vault_auth_bump];
-        let vault_auth_seeds: &[&[u8]] =
-            &[b"vault_auth", pool_pda.key.as_ref(), &vault_auth_bump_arr];
-        cpi::cpi_update_asset_authority(
-            percolator_program,
-            pool_pda,
-            authority_ai,
-            slab,
-            0,
-            cpi::ASSET_AUTH_INSURANCE,
-            &[admin_seeds, vault_auth_seeds],
-        )?;
-    }
+    // Keep wrapper insurance authority under vault PDA control. This prevents
+    // insurance withdrawals from bypassing vault-side accounting and checks.
+    let vault_auth_bump_arr = [vault_auth_bump];
+    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &vault_auth_bump_arr];
+
+    cpi::cpi_update_asset_authority(
+        percolator_program,
+        pool_pda,
+        authority_ai,
+        slab,
+        0,
+        cpi::ASSET_AUTH_INSURANCE,
+        &[admin_seeds, vault_auth_seeds],
+    )?;
 
     msg!("Asset-0 insurance authority rotated via CPI");
     Ok(())
 }
-
-// ============================================================================
-// PERC-272: LP Vault — Fee Accrual & Trading Pool Init
-// ============================================================================
-
-/// Accrue trading fees from the percolator engine to the LP vault.
-/// Permissionless: reads vault token account balance and updates pool state.
-///
-/// Fee delta = current_vault_balance - last_vault_snapshot - net_deposits_since_last
-/// To keep it simple and trustless: we track the vault token account balance directly.
-/// Any increase in vault balance beyond deposits is fee revenue.
 fn process_accrue_fees(_program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
     let accounts_iter = &mut accounts.iter();
     let caller = next_account_info(accounts_iter)?; // signer, permissionless
@@ -1446,6 +1437,55 @@ fn process_admin_set_hwm_config(
 mod tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    #[test]
+    fn vault_insurance_authority_guard_accepts_vault_auth() {
+        let program_id = Pubkey::new_unique();
+        let pool_pda = Pubkey::new_unique();
+        let (vault_auth, vault_auth_bump) = state::derive_vault_authority(&program_id, &pool_pda);
+
+        assert_eq!(
+            validate_vault_insurance_authority(&program_id, &pool_pda, &vault_auth, &vault_auth),
+            Ok(vault_auth_bump)
+        );
+    }
+
+    #[test]
+    fn vault_insurance_authority_guard_rejects_external_authority() {
+        let program_id = Pubkey::new_unique();
+        let pool_pda = Pubkey::new_unique();
+        let external_authority = Pubkey::new_unique();
+
+        assert_eq!(
+            validate_vault_insurance_authority(
+                &program_id,
+                &pool_pda,
+                &external_authority,
+                &external_authority
+            )
+            .unwrap_err(),
+            ProgramError::MissingRequiredSignature
+        );
+    }
+
+    #[test]
+    fn vault_insurance_authority_guard_rejects_mismatched_requested_authority() {
+        let program_id = Pubkey::new_unique();
+        let pool_pda = Pubkey::new_unique();
+        let (vault_auth, _) = state::derive_vault_authority(&program_id, &pool_pda);
+        let external_authority = Pubkey::new_unique();
+
+        assert_eq!(
+            validate_vault_insurance_authority(
+                &program_id,
+                &pool_pda,
+                &vault_auth,
+                &external_authority
+            )
+            .unwrap_err(),
+            ProgramError::from(StakeError::InvalidAccount)
+        );
+    }
 
     #[test]
     fn return_vault_guard_accepts_pool_vault() {
