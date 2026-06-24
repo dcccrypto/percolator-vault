@@ -195,9 +195,9 @@ fn validate_admin_cpi(
 /// insurance fund. Trading LP pools use vault-balance deltas for fee accrual,
 /// so allowing them to flush principal makes AccrueFees compare against the
 /// wrong baseline and can strand later fees below the flushed amount.
-fn validate_flush_pool_mode(pool: &StakePool) -> ProgramResult {
+fn validate_insurance_pool_mode(pool: &StakePool, context: &str) -> ProgramResult {
     if pool.pool_mode != 0 {
-        msg!("FlushToInsurance: pool is not an insurance LP pool");
+        msg!("{}: pool is not an insurance LP pool", context);
         return Err(StakeError::InvalidPoolMode.into());
     }
     Ok(())
@@ -781,7 +781,7 @@ fn process_flush_to_insurance(
     if pool.is_initialized != 1 {
         return Err(StakeError::NotInitialized.into());
     }
-    validate_flush_pool_mode(pool)?;
+    validate_insurance_pool_mode(pool, "FlushToInsurance")?;
 
     // CRITICAL (C10): FlushToInsurance must be admin-only.
     // Without this, ANY signer can drain the stake vault to wrapper insurance,
@@ -1126,6 +1126,7 @@ fn process_admin_withdraw_insurance(
     {
         let pool_data = pool_pda.try_borrow_data()?;
         let pool: &StakePool = bytemuck::from_bytes(&pool_data[..STAKE_POOL_SIZE]);
+        validate_insurance_pool_mode(pool, "AdminWithdrawInsurance")?;
         validate_return_vault(pool, stake_vault.key)?;
     }
 
@@ -1419,6 +1420,25 @@ mod tests {
     use bytemuck::Zeroable;
 
     #[test]
+    fn insurance_pool_mode_guard_accepts_insurance_pool() {
+        let mut pool = StakePool::zeroed();
+        pool.pool_mode = 0;
+
+        assert!(validate_insurance_pool_mode(&pool, "test").is_ok());
+    }
+
+    #[test]
+    fn insurance_pool_mode_guard_rejects_trading_pool() {
+        let mut pool = StakePool::zeroed();
+        pool.pool_mode = 1;
+
+        assert_eq!(
+            validate_insurance_pool_mode(&pool, "test").unwrap_err(),
+            StakeError::InvalidPoolMode.into()
+        );
+    }
+
+    #[test]
     fn return_vault_guard_accepts_pool_vault() {
         let vault = Pubkey::new_unique();
         let mut pool = StakePool::zeroed();
@@ -1472,24 +1492,5 @@ mod tests {
 
         assert_eq!(baseline, current_balance);
         assert_eq!(current_balance.saturating_sub(baseline), 0);
-    }
-
-    #[test]
-    fn flush_pool_mode_guard_allows_insurance_pools() {
-        let mut pool = StakePool::zeroed();
-        pool.pool_mode = 0;
-
-        assert!(validate_flush_pool_mode(&pool).is_ok());
-    }
-
-    #[test]
-    fn flush_pool_mode_guard_rejects_trading_pools() {
-        let mut pool = StakePool::zeroed();
-        pool.pool_mode = 1;
-
-        assert_eq!(
-            validate_flush_pool_mode(&pool).unwrap_err(),
-            StakeError::InvalidPoolMode.into()
-        );
     }
 }
