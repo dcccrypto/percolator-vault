@@ -289,6 +289,14 @@ fn process_init_pool(
         return Err(StakeError::InvalidPercolatorProgram.into());
     }
 
+    // InitPool now performs a wrapper UpdateAuthority CPI, and that CPI marks the
+    // slab/market writable. Require the outer InitPool account metadata to provide
+    // the same writable privilege before crossing the CPI boundary.
+    if !slab.is_writable {
+        msg!("InitPool: slab must be writable for admin handoff CPI");
+        return Err(ProgramError::InvalidArgument);
+    }
+
     let rent = Rent::from_account_info(rent_sysvar)?;
 
     // Create pool PDA account
