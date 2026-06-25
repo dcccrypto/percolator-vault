@@ -90,6 +90,9 @@ pub fn process(
             enabled,
             hwm_floor_bps,
         } => process_admin_set_hwm_config(program_id, accounts, enabled, hwm_floor_bps),
+        StakeInstruction::BindInsuranceAuthority => {
+            process_bind_insurance_authority(program_id, accounts)
+        }
     }
 }
 
@@ -1451,6 +1454,117 @@ fn process_admin_set_hwm_config(
         enabled,
         pool.hwm_floor_bps()
     );
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 15: BindInsuranceAuthority — FIND-4 fix
+// ═══════════════════════════════════════════════════════════════
+//
+// PROBLEM: At market creation, profile.insurance_authority = human admin.
+// The wrapper's UpdateAssetAuthority (tag 65) requires BOTH the current authority
+// AND the new authority to sign. When the new authority is our vault_auth PDA,
+// it cannot sign a top-level tx — only a CPI from this program via invoke_signed.
+// AdminSetInsurancePolicy was broken because it passed pool_pda as `current`,
+// but profile.insurance_authority is the human admin at bind time — not pool_pda.
+//
+// FIX: This instruction passes the human admin as `current` (outer tx signer) and
+// vault_auth as `new` (signed via invoke_signed). After this call,
+// profile.insurance_authority == vault_auth PDA, so FlushToInsurance
+// (TopUpInsurance CPI gated on insurance_authority) becomes reachable.
+//
+// INVARIANT PRESERVED: rotation remains possible via AdminSetInsurancePolicy,
+// which passes pool_pda as current (valid once vault_auth is already the authority).
+// No-lockout property holds: a future rotation to admin allows re-binding from a
+// new vault deployment.
+//
+// Accounts:
+//   0. [signer]   admin          — current insurance_authority (human admin, outer tx signer)
+//   1. [writable] pool_pda       — validated: is_initialized, admin matches, slab/program match
+//   2. []         vault_auth     — new authority (vault PDA, signs via invoke_signed)
+//   3. [writable] slab           — wrapper market account (writable for CPI)
+//   4. []         percolator_program — wrapper program for CPI dispatch
+//
+// Wire: tag(1) = 0x0F — no payload beyond the tag byte.
+
+fn process_bind_insurance_authority(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+) -> ProgramResult {
+    let accounts_iter = &mut accounts.iter();
+    let admin = next_account_info(accounts_iter)?;
+    let pool_pda = next_account_info(accounts_iter)?;
+    let vault_auth = next_account_info(accounts_iter)?;
+    let slab = next_account_info(accounts_iter)?;
+    let percolator_program = next_account_info(accounts_iter)?;
+
+    // Admin must sign the outer tx — they are the CURRENT insurance_authority.
+    if !admin.is_signer {
+        return Err(ProgramError::MissingRequiredSignature);
+    }
+
+    // Validate pool account ownership before bytemuck reinterpretation.
+    if pool_pda.owner != program_id {
+        msg!("BindInsuranceAuthority: pool_pda not owned by this program");
+        return Err(StakeError::InvalidAccount.into());
+    }
+    if pool_pda.data_is_empty() {
+        msg!("BindInsuranceAuthority: pool_pda is empty");
+        return Err(ProgramError::UninitializedAccount);
+    }
+
+    // Read pool state. Copy out fields before the CPI borrow.
+    let (pool_slab, pool_percolator) = {
+        let pool_data = pool_pda.try_borrow_data()?;
+        let pool: &state::StakePool =
+            bytemuck::from_bytes(&pool_data[..state::STAKE_POOL_SIZE]);
+
+        if pool.is_initialized != 1 {
+            return Err(StakeError::NotInitialized.into());
+        }
+        if !pool.validate_discriminator() {
+            return Err(StakeError::InvalidAccount.into());
+        }
+        // Admin check: only the pool admin may initiate the bind.
+        if pool.admin != admin.key.to_bytes() {
+            return Err(StakeError::Unauthorized.into());
+        }
+        (pool.slab, pool.percolator_program)
+    };
+
+    // Guard against attacker-supplied slab or program.
+    if pool_slab != slab.key.to_bytes() {
+        return Err(StakeError::InvalidPda.into());
+    }
+    if pool_percolator != percolator_program.key.to_bytes() {
+        return Err(StakeError::InvalidPercolatorProgram.into());
+    }
+
+    // Derive + verify the vault_auth PDA (the new authority we are binding).
+    let (expected_vault_auth, vault_auth_bump) =
+        state::derive_vault_authority(program_id, pool_pda.key);
+    if *vault_auth.key != expected_vault_auth {
+        return Err(StakeError::InvalidPda.into());
+    }
+
+    // CPI: UpdateAssetAuthority (tag 65, kind=INSURANCE=1, asset_index=0).
+    //   current = admin (human, outer tx signer)
+    //   new     = vault_auth (PDA, we sign via invoke_signed)
+    //   market  = slab (writable)
+    let vault_auth_bump_arr = [vault_auth_bump];
+    let vault_auth_seeds: &[&[u8]] = &[b"vault_auth", pool_pda.key.as_ref(), &vault_auth_bump_arr];
+
+    cpi::cpi_update_asset_authority(
+        percolator_program,
+        admin,      // current authority = human admin (outer tx signer)
+        vault_auth, // new authority = vault_auth PDA (invoke_signed)
+        slab,
+        0,                         // asset_index = 0
+        cpi::ASSET_AUTH_INSURANCE, // kind = 1 (insurance_authority)
+        &[vault_auth_seeds],
+    )?;
+
+    msg!("BindInsuranceAuthority: asset-0 insurance_authority bound to vault_auth PDA");
     Ok(())
 }
 

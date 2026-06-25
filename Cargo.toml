@@ -27,3 +27,12 @@ crate-type = ["cdylib", "lib"]
 [dev-dependencies]
 solana-sdk = "=2.2.1"
 proptest = "1.4"
+
+# FIND-4 LiteSVM e2e: loads vault + wrapper .so and drives bind→flush→withdraw.
+# litesvm 0.6 targets solana 2.2 (matches solana-sdk pin).
+litesvm = "0.6"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Pin crates that use edition2024 manifests (incompatible with cargo-build-sbf's cargo 1.79).
+[patch.crates-io]
+blake3 = { git = "https://github.com/BLAKE3-team/BLAKE3", tag = "1.5.5" }

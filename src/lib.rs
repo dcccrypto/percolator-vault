@@ -35,6 +35,11 @@
 //!  11 - AdminSetInsurancePolicy:  Rotate asset-0 insurance authority; legacy policy fields zero
 //!  12 - AccrueFees:               Permissionless crank — accrues trading fees
 //!  13 - InitTradingPool:          Create trading LP pool (mode 1)
+//!  14 - AdminSetHwmConfig:        Set high-water mark floor config (PERC-313)
+//!  15 - BindInsuranceAuthority:   FIND-4 fix: initial bind of asset-0 insurance_authority
+//!                                 to vault_auth PDA. Admin (current holder) signs the outer
+//!                                 tx; vault_auth PDA signs via invoke_signed as new.
+//!                                 Required once after market init, before FlushToInsurance.
 
 pub mod cpi;
 pub mod error;

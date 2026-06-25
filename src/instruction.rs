@@ -204,6 +204,29 @@ pub enum StakeInstruction {
     ///   0. `[signer]` Admin
     ///   1. `[writable]` Pool PDA
     AdminSetHwmConfig { enabled: bool, hwm_floor_bps: u16 },
+
+    /// FIND-4 fix: initial bind of the wrapper market's asset-0 insurance_authority
+    /// to the vault_auth PDA. This is the ONE-TIME setup step that makes
+    /// FlushToInsurance (which CPIs TopUpInsurance gated on insurance_authority)
+    /// actually reachable.
+    ///
+    /// WHY THIS IS NEEDED: at market init, profile.insurance_authority = human admin.
+    /// The wrapper's UpdateAssetAuthority (tag 65) requires BOTH current AND new to
+    /// sign. The new authority is our vault_auth PDA — a PDA can only sign via
+    /// invoke_signed from its owning program. This instruction issues that CPI so
+    /// vault_auth signs as `new` while the human admin signs the outer tx as `current`.
+    ///
+    /// After this call, profile.insurance_authority == vault_auth PDA, and
+    /// FlushToInsurance succeeds. The existing rotation path (AdminSetInsurancePolicy)
+    /// remains intact for subsequent rotations where vault_auth is already the current.
+    ///
+    /// Accounts:
+    ///   0. `[signer]`   Admin (current insurance_authority = human admin at bind time)
+    ///   1. `[writable]` Pool PDA (validated: is_initialized, admin matches, records slab/program)
+    ///   2. `[]`         Vault authority PDA (new authority, vault program signs via invoke_signed)
+    ///   3. `[writable]` Slab / market account (wrapper-owned, writable for CPI)
+    ///   4. `[]`         Percolator program ID
+    BindInsuranceAuthority,
 }
 
 impl StakeInstruction {
@@ -330,6 +353,7 @@ impl StakeInstruction {
                     hwm_floor_bps,
                 })
             }
+            15 => Ok(Self::BindInsuranceAuthority),
             _ => Err(ProgramError::InvalidInstructionData),
         }
     }
