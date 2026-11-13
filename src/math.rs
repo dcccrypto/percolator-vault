@@ -223,8 +223,7 @@ pub fn weighted_deposit_slot(
         // aged_credit = cooldown_slots * existing_lp / total_lp
         // Maximum value: cooldown_slots (u64::MAX) * existing_lp (u64::MAX) = 2^128 - 2^65 + 1
         // which fits u128. Divided by total_lp ≥ 1. Result ≤ cooldown_slots ≤ u64::MAX.
-        let aged_credit_u128 =
-            (cooldown_slots as u128) * (existing_lp as u128) / total_lp;
+        let aged_credit_u128 = (cooldown_slots as u128) * (existing_lp as u128) / total_lp;
         // Saturating cast: aged_credit ≤ cooldown_slots ≤ u64::MAX so this never saturates,
         // but the cast makes the invariant explicit and future-proof.
         let aged_credit = aged_credit_u128.min(u64::MAX as u128) as u64;
@@ -470,11 +469,16 @@ mod tests {
         // NOT immediately withdrawable (the tiny top-up adds just 1 slot of
         // extra wait, not a full re-lock of 1_000_000 extra slots).
         let s = weighted_deposit_slot(1_000_000, 0, 1, 1_000_000, 1_000_000);
-        assert_eq!(s, 1, "tiny top-up must not re-lock a large aged position for a full cooldown");
+        assert_eq!(
+            s, 1,
+            "tiny top-up must not re-lock a large aged position for a full cooldown"
+        );
         // Specifically: NOT re-locked for a full cooldown (which would be
         // unlock = 1_000_000 + 1_000_000 = 2_000_000).
-        assert!(s + 1_000_000 <= 1_000_000 + 2,
-            "unlock must not be a full extra cooldown beyond current_slot");
+        assert!(
+            s + 1_000_000 <= 1_000_000 + 2,
+            "unlock must not be a full extra cooldown beyond current_slot"
+        );
     }
 
     #[test]

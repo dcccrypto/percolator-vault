@@ -414,8 +414,13 @@ fn test_topup_does_not_relock_large_aged_position() {
     // ── exact processor update sequence (#8/#39 fix) ──
     let existing_lp = deposit.lp_amount;
     let existing_slot = deposit.last_deposit_slot;
-    deposit.last_deposit_slot =
-        weighted_deposit_slot(existing_lp, existing_slot, topup_lp, topup_slot, cooldown_slots);
+    deposit.last_deposit_slot = weighted_deposit_slot(
+        existing_lp,
+        existing_slot,
+        topup_lp,
+        topup_slot,
+        cooldown_slots,
+    );
     deposit.lp_amount = existing_lp.checked_add(topup_lp).unwrap();
 
     // Proportional floor: 10_000 - (1_000 * 1_000_000 / 1_000_001) = 10_000 - 999 = 9_001.
@@ -477,8 +482,13 @@ fn test_large_fresh_deposit_still_covered_by_cooldown() {
 
     let existing_lp = deposit.lp_amount;
     let existing_slot = deposit.last_deposit_slot;
-    deposit.last_deposit_slot =
-        weighted_deposit_slot(existing_lp, existing_slot, new_lp, deposit_slot, cooldown_slots);
+    deposit.last_deposit_slot = weighted_deposit_slot(
+        existing_lp,
+        existing_slot,
+        new_lp,
+        deposit_slot,
+        cooldown_slots,
+    );
     deposit.lp_amount = existing_lp.checked_add(new_lp).unwrap();
 
     // Proportional floor (small aged position, large fresh deposit):
@@ -527,11 +537,20 @@ fn test_issue39_large_fresh_deposit_onto_aged_whale_is_not_immediately_withdrawa
 
     // ── 8× scenario (old bypass, pre-fix blended=88_888, unlock=98_888 < 100k) ──
     let fresh_8x: u64 = 8_000_000;
-    let blended_8x = weighted_deposit_slot(existing_lp, existing_slot, fresh_8x, current_slot, cooldown_slots);
+    let blended_8x = weighted_deposit_slot(
+        existing_lp,
+        existing_slot,
+        fresh_8x,
+        current_slot,
+        cooldown_slots,
+    );
     let unlock_8x = blended_8x.saturating_add(cooldown_slots);
     // Proportional floor: aged_credit = 10_000 * 1M / 9M = 1_111; floor = 98_889
     // blended = max(88_888, 98_889) = 98_889; unlock = 108_889
-    assert_eq!(blended_8x, 98_889, "8x: blended must equal proportional floor 98_889");
+    assert_eq!(
+        blended_8x, 98_889,
+        "8x: blended must equal proportional floor 98_889"
+    );
     assert_eq!(unlock_8x, 108_889);
     // Gate check (matches processor.rs:700-705 exactly):
     // CooldownNotElapsed fires iff `clock.slot < last_deposit_slot + cooldown_slots`
@@ -542,11 +561,20 @@ fn test_issue39_large_fresh_deposit_onto_aged_whale_is_not_immediately_withdrawa
 
     // ── 9× scenario (old bypass: blended=90_000, unlock=100_000 = current → gate passed) ──
     let fresh_9x: u64 = 9_000_000;
-    let blended_9x = weighted_deposit_slot(existing_lp, existing_slot, fresh_9x, current_slot, cooldown_slots);
+    let blended_9x = weighted_deposit_slot(
+        existing_lp,
+        existing_slot,
+        fresh_9x,
+        current_slot,
+        cooldown_slots,
+    );
     let unlock_9x = blended_9x.saturating_add(cooldown_slots);
     // Proportional floor: aged_credit = 10_000 * 1M / 10M = 1_000; floor = 99_000
     // blended = max(90_000, 99_000) = 99_000; unlock = 109_000
-    assert_eq!(blended_9x, 99_000, "9x: blended must equal proportional floor 99_000");
+    assert_eq!(
+        blended_9x, 99_000,
+        "9x: blended must equal proportional floor 99_000"
+    );
     assert_eq!(unlock_9x, 109_000);
     assert!(
         current_slot < unlock_9x,
@@ -560,9 +588,15 @@ fn test_issue39_large_fresh_deposit_onto_aged_whale_is_not_immediately_withdrawa
         // raw without floor: 8M * 100k / 9M = 88_888 (integer div)
         (8_000_000u128 * 100_000 / 9_000_000) as u64
     };
-    assert!(blended_8x > blended_8x_raw, "floor must have lifted the 8x blended slot");
+    assert!(
+        blended_8x > blended_8x_raw,
+        "floor must have lifted the 8x blended slot"
+    );
     let blended_9x_raw = (9_000_000u128 * 100_000 / 10_000_000) as u64; // = 90_000
-    assert!(blended_9x > blended_9x_raw, "floor must have lifted the 9x blended slot");
+    assert!(
+        blended_9x > blended_9x_raw,
+        "floor must have lifted the 9x blended slot"
+    );
 }
 
 /// Complementary: a position that is NOT over-aged (existing position is younger
@@ -581,15 +615,27 @@ fn test_issue39_floor_inactive_for_recently_deposited_existing_position() {
     // Large fresh deposit (9× existing).
     let fresh_lp: u64 = 9_000_000;
 
-    let blended = weighted_deposit_slot(existing_lp, existing_slot, fresh_lp, current_slot, cooldown_slots);
+    let blended = weighted_deposit_slot(
+        existing_lp,
+        existing_slot,
+        fresh_lp,
+        current_slot,
+        cooldown_slots,
+    );
     // Blended without floor: lo=5_000, existing_span=0, current_span=5_000
     //   = 5_000 + 9_000_000 * 5_000 / 10_000_000 = 5_000 + 4_500 = 9_500
     // Floor = 10_000 - 10_000 = 0; max(9_500, 0) = 9_500 (floor is inactive).
-    assert_eq!(blended, 9_500, "floor must be inactive when existing position is recent");
+    assert_eq!(
+        blended, 9_500,
+        "floor must be inactive when existing position is recent"
+    );
 
     // The fresh capital is locked: unlock = 9_500 + 10_000 = 19_500 > current_slot.
     let unlock_at = blended.saturating_add(cooldown_slots);
-    assert!(current_slot < unlock_at, "fresh deposit on recent position must still face the cooldown");
+    assert!(
+        current_slot < unlock_at,
+        "fresh deposit on recent position must still face the cooldown"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════
