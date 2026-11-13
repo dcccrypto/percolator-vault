@@ -223,8 +223,7 @@ pub fn weighted_deposit_slot(
         // aged_credit = cooldown_slots * existing_lp / total_lp
         // Maximum value: cooldown_slots (u64::MAX) * existing_lp (u64::MAX) = 2^128 - 2^65 + 1
         // which fits u128. Divided by total_lp ≥ 1. Result ≤ cooldown_slots ≤ u64::MAX.
-        let aged_credit_u128 =
-            (cooldown_slots as u128) * (existing_lp as u128) / total_lp;
+        let aged_credit_u128 = (cooldown_slots as u128) * (existing_lp as u128) / total_lp;
         // Saturating cast: aged_credit ≤ cooldown_slots ≤ u64::MAX so this never saturates,
         // but the cast makes the invariant explicit and future-proof.
         let aged_credit = aged_credit_u128.min(u64::MAX as u128) as u64;
@@ -470,11 +469,16 @@ mod tests {
         // NOT immediately withdrawable (the tiny top-up adds just 1 slot of
         // extra wait, not a full re-lock of 1_000_000 extra slots).
         let s = weighted_deposit_slot(1_000_000, 0, 1, 1_000_000, 1_000_000);
-        assert_eq!(s, 1, "tiny top-up must not re-lock a large aged position for a full cooldown");
+        assert_eq!(
+            s, 1,
+            "tiny top-up must not re-lock a large aged position for a full cooldown"
+        );
         // Specifically: NOT re-locked for a full cooldown (which would be
         // unlock = 1_000_000 + 1_000_000 = 2_000_000).
-        assert!(s + 1_000_000 <= 1_000_000 + 2,
-            "unlock must not be a full extra cooldown beyond current_slot");
+        assert!(
+            s + 1_000_000 <= 1_000_000 + 2,
+            "unlock must not be a full extra cooldown beyond current_slot"
+        );
     }
 
     #[test]
@@ -692,3 +696,59 @@ mod hwm_tests {
 // Keeping this note here so nobody adds u64 Kani proofs that timeout.
 
 // (PERC-272 tests moved to mod tests above)
+
+#[cfg(test)]
+mod round_trip_sweep {
+    use super::*;
+
+    // Fixed seed so the sweep below replays the same sequence on every run.
+    const SWEEP_SEED: u64 = 0x3B9D_C4A1_7E52_08F6;
+
+    fn step(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    /// A deposit followed by an immediate full redeem of the freshly minted LP
+    /// never hands back more than went in; rounding always lands on the pool.
+    #[test]
+    fn vault_tail_lane_0x3b9d_never_pays_out_more_than_it_took_in() {
+        let mut s = SWEEP_SEED;
+        let mut checked = 0u32;
+        for _ in 0..96 {
+            let supply = step(&mut s) % 1_000_000_007 + 1;
+            let value = step(&mut s) % 1_000_000_007 + 1;
+            let dep = step(&mut s) % 999_983 + 1;
+            if let Some(lp) = calc_lp_for_deposit(supply, value, dep) {
+                let back = calc_collateral_for_withdraw(supply + lp, value + dep, lp)
+                    .expect("non-zero supply cannot divide by zero");
+                assert!(back <= dep, "paid {back} for a deposit of {dep}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 0);
+    }
+
+    /// The ledger rows settle before the floor re-reads: odd bps values walked
+    /// from the wide end inward, each compared against a plain u128 expression.
+    #[test]
+    fn hwm_floor_odd_bps_walk_inward() {
+        let rows: [(u64, u16); 5] = [
+            (8_191_000, 9_973),
+            (8_191_000, 3_737),
+            (65_537, 1_009),
+            (65_537, 101),
+            (7, 9_999),
+        ];
+        for (tvl, bps) in rows {
+            let want = (tvl as u128 * bps as u128 / 10_000) as u64;
+            assert_eq!(hwm_floor(tvl, bps), Some(want), "tvl={tvl} bps={bps}");
+            assert!(hwm_withdrawal_allowed(want, tvl, bps));
+            if want > 0 {
+                assert!(!hwm_withdrawal_allowed(want - 1, tvl, bps));
+            }
+        }
+    }
+}

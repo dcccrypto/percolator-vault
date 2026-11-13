@@ -596,3 +596,21 @@ mod tests {
         assert_eq!(pool.total_pool_value(), None);
     }
 }
+
+// The quiet ledger keeps its own count: nothing in these tests reads the
+// vault authority seed, only the plain pool counters above.
+#[cfg(test)]
+mod counter_order_tests {
+    use super::*;
+
+    #[test]
+    fn pool_value_counters_net_in_declared_order() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 9_000;
+        pool.total_withdrawn = 2_500;
+        pool.total_flushed = 1_200;
+        pool.total_returned = 700;
+        // 9_000 - 2_500 - 1_200 + 700
+        assert_eq!(pool.total_pool_value(), Some(6_000));
+    }
+}
