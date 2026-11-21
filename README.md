@@ -53,13 +53,14 @@ The vault PDA becomes the **admin** of the percolator wrapper slab. This means:
 | 11 | `AdminSetInsurancePolicy` | Rotate wrapper asset-0 insurance authority; legacy policy fields must be zero |
 | 12 | `AccrueFees` | Permissionless crank — accrues trading fees into vault |
 | 13 | `InitTradingPool` | Create a trading LP pool (mode 1) |
+| 14 | `AdminSetHwmConfig` | Admin sets the high-water-mark config (`enabled`, `hwm_floor_bps`) |
 
 ### Key Data Structures
 
 - **StakePool** — Per-slab pool state (PDA seeds: `[b"stake_pool", slab_pubkey]`)
   - Tracks deposits, withdrawals, LP supply, insurance flushes, fee accruals
   - `pool_mode`: 0 = insurance, 1 = trading LP
-- **StakeDeposit** — Per-user deposit record (PDA seeds: `[b"deposit", pool_pubkey, user_pubkey]`)
+- **StakeDeposit** — Per-user deposit record (PDA seeds: `[b"stake_deposit", pool_pubkey, user_pubkey]`)
   - Tracks deposit slot for cooldown enforcement
 
 ## Building
@@ -107,7 +108,8 @@ Proofs verify:
 
 This program is designed to work with:
 - [`percolator-prog`](https://github.com/dcccrypto/percolator-prog) — the core perp engine (wrapper)
-- [`percolator-launch`](https://github.com/dcccrypto/percolator-launch) — the frontend + SDK
+- [`percolator-sdk`](https://github.com/dcccrypto/percolator-sdk) — the TypeScript SDK
+- [`percolator-launch`](https://github.com/dcccrypto/percolator-launch) — the web app
 
 The vault CPI-calls into the wrapper for insurance operations and admin forwarding.
 The wrapper only knows that its `header.admin` signed the instruction — it doesn't know
