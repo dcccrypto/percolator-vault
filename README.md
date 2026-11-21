@@ -60,7 +60,7 @@ The vault PDA becomes the **admin** of the percolator wrapper slab. This means:
 - **StakePool** — Per-slab pool state (PDA seeds: `[b"stake_pool", slab_pubkey]`)
   - Tracks deposits, withdrawals, LP supply, insurance flushes, fee accruals
   - `pool_mode`: 0 = insurance, 1 = trading LP
-- **StakeDeposit** — Per-user deposit record (PDA seeds: `[b"deposit", pool_pubkey, user_pubkey]`)
+- **StakeDeposit** — Per-user deposit record (PDA seeds: `[b"stake_deposit", pool_pubkey, user_pubkey]`)
   - Tracks deposit slot for cooldown enforcement
 
 ## Building
